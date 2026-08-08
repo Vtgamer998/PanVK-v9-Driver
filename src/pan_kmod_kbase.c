@@ -41,6 +41,8 @@ static void pan_kmod_wedge_set(void) {
     if (f) { fprintf(f, "GPU wedged\n"); fclose(f); }
 }
 static void pan_kmod_wedge_clear(void) { unlink(PAN_KMOD_WEDGE_FILE); }
+
+struct pan_kmod_dev {
     struct kbase_dev *kdev;
     struct pan_kmod_dev_props props;
     /* Serialises every access to dev->kdev (including pan_kmod_dev_reopen
@@ -154,18 +156,12 @@ int pan_kmod_dev_reopen(struct pan_kmod_dev *dev) {
      * events are already in the fd's read buffer when we consume them.
      * Without this wait the drain misses them and they arrive during the next
      * submit, being consumed as fake completions for the new atoms. */
-    struct timespec ts = { .tv_sec = 0, .tv_nsec = 60 * 1000000L }; /* 60ms */
+    struct timespec ts = { .tv_sec = 0, .tv_nsec = 10 * 1000000L }; /* 10ms */
     nanosleep(&ts, NULL);
 
-    /* Two-pass drain: the first pass consumes events already buffered; a short
-     * pause then catches any stragglers that arrived between the open and the
-     * first drain (MTK r49 event delivery is asynchronous and can span 50+ ms). */
     int total = kbase_drain_events(dev->kdev);
-    ts.tv_nsec = 15 * 1000000L; /* 15ms */
-    nanosleep(&ts, NULL);
-    total += kbase_drain_events(dev->kdev);
     if (total > 0)
-        fprintf(stderr, "pan_kmod_dev_reopen: drained %d stale events (incl. delayed)\n", total);
+        fprintf(stderr, "pan_kmod_dev_reopen: drained %d stale events\n", total);
 
     /* Set atom_counter to 200 so the first atoms of the new context use ids
      * 201-254 — a safe zone that never collides with stale events from the old
@@ -240,9 +236,9 @@ int pan_kmod_submit_atom(struct pan_kmod_dev *dev, uint64_t jc_gpu, uint32_t cor
                          uint32_t atom_id, uint32_t *event_code) {
     /* Never wait forever on a GPU atom: a hung job must fail fast so the
      * test harness can exit instead of tripping the Mali watchdog (which
-     * reboots the phone).  Default 1500ms, override via PANVK_SUBMIT_TIMEOUT_MS. */
+     * reboots the phone).  Default 400ms, override via PANVK_SUBMIT_TIMEOUT_MS. */
     return pan_kmod_submit_atom_timeout(dev, jc_gpu, core_req, atom_id, event_code,
-                                        kbase_submit_timeout_ms(1500));
+                                        kbase_submit_timeout_ms(400));
 }
 
 int pan_kmod_submit_atom_timeout(struct pan_kmod_dev *dev, uint64_t jc_gpu, uint32_t core_req,
@@ -266,7 +262,7 @@ int pan_kmod_submit_atom_timeout(struct pan_kmod_dev *dev, uint64_t jc_gpu, uint
          * / re-reads lost completions — consuming the wrong atom's event here
          * is what makes the caller advance while its job is still on the slot,
          * triggering JOB_READ_FAULT and wedging the scheduler). */
-        if (timeout_ms <= 0) timeout_ms = kbase_submit_timeout_ms(1500);
+        if (timeout_ms <= 0) timeout_ms = kbase_submit_timeout_ms(400);
         ret = kbase_wait_event_timeout(dev->kdev, &rx_atom, &rx_code, timeout_ms, assigned_atom);
     }
 
@@ -308,7 +304,8 @@ int pan_kmod_submit_flush_timeout(struct pan_kmod_dev *dev, uint64_t jc_gpu,
 }
 
 int pan_kmod_submit_fragment_timeout(struct pan_kmod_dev *dev, uint64_t jc_gpu, uint32_t core_req,
-                                     uint32_t atom_id, uint32_t *event_code, int timeout_ms) {
+                                     uint32_t atom_id, uint32_t *event_code, int timeout_ms,
+                                     int skip_unwedge) {
     if (!dev || !dev->kdev) return -EINVAL;
 
     /* Permanently wedged GPU: stop immediately without opening more fds.
@@ -346,23 +343,25 @@ int pan_kmod_submit_fragment_timeout(struct pan_kmod_dev *dev, uint64_t jc_gpu, 
      * Pass the rotating atom number assigned by submit so the wait skips
      * stale events from other atoms — consuming the wrong atom's event is
      * what lets the caller advance while its job is still on the slot. */
-    if (timeout_ms <= 0) timeout_ms = kbase_submit_timeout_ms(1500);
+    if (timeout_ms <= 0) timeout_ms = kbase_submit_timeout_ms(400);
     ret = kbase_wait_event_timeout(dev->kdev, &rx_atom, &rx_code, timeout_ms, assigned_atom);
 
     if (event_code) *event_code = rx_code;
     if (ret == -EAGAIN) {
         fprintf(stderr, "pan_kmod: fragment atom %u TIMED OUT (timeout=%dms) - GPU may be hung\n",
                 atom_id, timeout_ms);
-        dev->consecutive_failures++;
-        if (dev->consecutive_failures < PAN_KMOD_MAX_CONSECUTIVE_FAILURES) {
-            pan_kmod_dev_reopen(dev);
-        } else {
-            fprintf(stderr,
-                "pan_kmod: %d consecutive failures — GPU permanently wedged, "
-                "writing wedge marker and refusing further submits.\n"
-                "Reboot the device to recover.\n",
-                dev->consecutive_failures);
-            pan_kmod_wedge_set();
+        if (!skip_unwedge) {
+            dev->consecutive_failures++;
+            if (dev->consecutive_failures < PAN_KMOD_MAX_CONSECUTIVE_FAILURES) {
+                pan_kmod_dev_reopen(dev);
+            } else {
+                fprintf(stderr,
+                    "pan_kmod: %d consecutive failures — GPU permanently wedged, "
+                    "writing wedge marker and refusing further submits.\n"
+                    "Reboot the device to recover.\n",
+                    dev->consecutive_failures);
+                pan_kmod_wedge_set();
+            }
         }
         pthread_mutex_unlock(&dev->dev_lock);
         return -ETIMEDOUT;
@@ -378,13 +377,17 @@ int pan_kmod_submit_fragment_timeout(struct pan_kmod_dev *dev, uint64_t jc_gpu, 
          * only fall back to reopen() if that fails.  The render may still
          * have completed — return 0, caller verifies pixels.  The unwedge
          * atom must differ from the REAL fragment atom number (assigned_atom),
-         * not the caller's ignored atom_id hint. */
-        uint8_t uw_atom = (uint8_t)((assigned_atom % 254) + 1);
-        if (uw_atom == assigned_atom)
-            uw_atom = (uint8_t)((uw_atom % 254) + 1);
-        if (kbase_slot_unwedge(dev->kdev, uw_atom, 200) != 0) {
-            fprintf(stderr, "pan_kmod: fragment 0x42 JOB_READ_FAULT - auto-reopening kbase context\n");
-            pan_kmod_dev_reopen(dev);
+         * not the caller's ignored atom_id hint.
+         * When skip_unwedge=1 (FRESH_DEV mode), skip unwedge/reopen since
+         * the caller will destroy+create a fresh device anyway. */
+        if (!skip_unwedge) {
+            uint8_t uw_atom = (uint8_t)((assigned_atom % 254) + 1);
+            if (uw_atom == assigned_atom)
+                uw_atom = (uint8_t)((uw_atom % 254) + 1);
+            if (kbase_slot_unwedge(dev->kdev, uw_atom, 200) != 0) {
+                fprintf(stderr, "pan_kmod: fragment 0x42 JOB_READ_FAULT - auto-reopening kbase context\n");
+                pan_kmod_dev_reopen(dev);
+            }
         }
         pthread_mutex_unlock(&dev->dev_lock);
         return 0;
@@ -405,24 +408,28 @@ int pan_kmod_submit_fragment_timeout(struct pan_kmod_dev *dev, uint64_t jc_gpu, 
          * in <2ms.  After it returns the slot is clean and the next frame
          * can submit immediately without pan_kmod_dev_reopen().  The unwedge
          * atom must differ from the REAL fragment atom number (assigned_atom),
-         * not the caller's ignored atom_id hint. */
-        uint8_t unwedge_atom = (uint8_t)((assigned_atom % 254) + 1);
-        if (unwedge_atom == assigned_atom)
-            unwedge_atom = (uint8_t)((unwedge_atom % 254) + 1);
+         * not the caller's ignored atom_id hint.
+         * When skip_unwedge=1 (FRESH_DEV mode), skip unwedge since the caller
+         * will destroy+create a fresh device anyway. */
+        if (!skip_unwedge) {
+            uint8_t unwedge_atom = (uint8_t)((assigned_atom % 254) + 1);
+            if (unwedge_atom == assigned_atom)
+                unwedge_atom = (uint8_t)((unwedge_atom % 254) + 1);
 
-        int uw = kbase_slot_unwedge(dev->kdev, unwedge_atom, 200);
-        if (uw != 0) {
-            fprintf(stderr,
-                "pan_kmod: slot unwedge failed (%d), falling back to dev_reopen\n", uw);
-            pan_kmod_dev_reopen(dev);
-            /* After dev_reopen the GPU hardware slot may still be wedged
-             * (the MTK r49 GPU shares slots across kbase contexts).  Do NOT
-             * poison here — the render may have actually completed
-             * (TERMINATED means the kernel stopped the job AFTER execution).
-             * The caller (v9_cmd_buffer_submit) verifies pixels and only
-             * sets the permanent wedge marker when the render truly failed
-             * (rendered=false).  Poisoning here would block all subsequent
-             * submits even when the frame rendered successfully. */
+            int uw = kbase_slot_unwedge(dev->kdev, unwedge_atom, 200);
+            if (uw != 0) {
+                fprintf(stderr,
+                    "pan_kmod: slot unwedge failed (%d), falling back to dev_reopen\n", uw);
+                pan_kmod_dev_reopen(dev);
+                /* After dev_reopen the GPU hardware slot may still be wedged
+                 * (the MTK r49 GPU shares slots across kbase contexts).  Do NOT
+                 * poison here — the render may have actually completed
+                 * (TERMINATED means the kernel stopped the job AFTER execution).
+                 * The caller (v9_cmd_buffer_submit) verifies pixels and only
+                 * sets the permanent wedge marker when the render truly failed
+                 * (rendered=false).  Poisoning here would block all subsequent
+                 * submits even when the frame rendered successfully. */
+            }
         }
     }
 
