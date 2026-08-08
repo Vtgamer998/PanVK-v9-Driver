@@ -1,0 +1,14 @@
+# Binários compilados
+*.so
+*.o
+
+# Logs
+*.log
+
+# Temporários
+.tmp_*
+.analysis/
+
+# Build output
+PanVK-v9-Kimchi/
+PanVK-v9-driver_winlator_kimchi.zip

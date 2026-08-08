@@ -1,0 +1,7 @@
+{
+    "file_format_version": "1.0.0",
+    "ICD": {
+        "library_path": "./libvulkan_panvk_v9.so",
+        "api_version": "1.2.0"
+    }
+}
