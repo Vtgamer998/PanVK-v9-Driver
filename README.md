@@ -1,209 +1,227 @@
-# PanVK-v9 Driver — Vulkan ICD para Mali-G68 MC4
+# PanVK-v9 Driver — Vulkan ICD for Mali-G68 MC4
 
-Driver Vulkan experimental para **ARM Mali-G68 MC4 (MediaTek MT6893, Valhall v9)**.
+Experimental Vulkan driver for **ARM Mali-G68 MC4 (MediaTek MT6893, Valhall v9)**.
 
 ---
 
-## ⚠️ AVISO IMPORTANTE — LEIA ANTES DE USAR
+## ⚠️ IMPORTANT NOTICE — READ BEFORE USE
 
-### Isenção de Responsabilidade
+### Disclaimer
 
-**ESTE SOFTWARE É FORNECIDO "COMO ESTÁ", SEM GARANTIAS DE QUALQUER TIPO.**
+**THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.**
 
-O autor **NÃO SE RESPONSABILIZA** por quaisquer danos diretos, indiretos, incidentais, especiais, consequenciais ou punitivos decorrentes do uso ou impossibilidade de uso deste software, incluindo mas não se limitando a:
+The author **IS NOT RESPONSIBLE** for any direct, indirect, incidental, special, consequential, or punitive damages arising from the use or inability to use this software, including but not limited to:
 
-- **DANOS AO HARDWARE**: Travamento do celular, reinicialização forçada, dano permanente à GPU ou outros componentes
-- **PERDA DE DADOS**: Corrupção de dados, configurações ou aplicações
-- **INSTABILIDADE DO SISTEMA**: Congelamento, crashes do sistema operacional
-- **VIOLAÇÃO DE GARANTIA**: Uso deste software pode anular a garantia do dispositivo
-- **DANOS AO SISTEMA OPERACIONAL**: Possível corrupção do Android ou kernel
+- **HARDWARE DAMAGE**: Phone crash, forced reboot, permanent GPU or component damage
+- **DATA LOSS**: Corruption of data, configurations, or applications
+- **SYSTEM INSTABILITY**: Freezing, operating system crashes
+- **WARRANTY VOID**: Using this software may void the device warranty
+- **OPERATING SYSTEM DAMAGE**: Possible corruption of Android or kernel
 
-**VOCÊ ASSUME TODA A RESPONSABILIDADE PELO USO DESTE SOFTWARE.**
+**YOU ASSUME ALL RESPONSIBILITY FOR USING THIS SOFTWARE.**
 
-### Riscos Conhecidos
+### Known Risks
 
-| Risco | Severidade | Descrição |
+| Risk | Severity | Description |
 |---|---|---|
-| **Reinicialização do celular** | ALTA | A GPU pode entrar em estado de JOB_READ_FAULT, causando reinício forçado pelo watchdog |
-| **Travamento do sistema** | ALTA | Timeout de GPU pode congelar o dispositivo |
-| **Dano à GPU** | MÉDIA | Uso indevido pode causar superaquecimento ou desgaste prematuro |
-| **Perda de dados** | MÉDIA | Reinicialização forçada pode causar perda de dados não salvos |
-| **Anulação de garantia** | ALTA | Modificações no sistema podem anular a garantia do fabricante |
+| **Phone reboot** | HIGH | GPU may enter JOB_READ_FAULT state, causing forced reboot by watchdog |
+| **System freeze** | HIGH | GPU timeout may freeze the device |
+| **GPU damage** | MEDIUM | Improper use may cause overheating or premature wear |
+| **Data loss** | MEDIUM | Forced reboot may cause loss of unsaved data |
+| **Warranty void** | HIGH | System modifications may void manufacturer warranty |
 
-### Recomendações de Segurança
+### Safety Recommendations
 
-1. **FAÇA BACKUP** de todos os dados importantes antes de usar
-2. **NÃO USE** em dispositivo principal ou com dados críticos
-3. **MANTENHA** o celular carregando e com boa ventilação
-4. **USE** `PANVK_DRY_RUN=1` por padrão (modo seguro, sem GPU real)
-5. **REINICIE** o celular imediatamente se notar comportamento estranho
-6. **NÃO MODIFIQUE** o kernel ou sistema operacional
+1. **BACKUP** all important data before use
+2. **DO NOT USE** on primary device or with critical data
+3. **KEEP** phone charging and well ventilated
+4. **USE** `PANVK_DRY_RUN=1` by default (safe mode, no real GPU)
+5. **REBOOT** phone immediately if abnormal behavior is noticed
+6. **DO NOT MODIFY** kernel or operating system
 
 ---
 
-## Créditos e Agradecimentos
+## Credits and Acknowledgments
 
-### Projeto Base
+### Base Project
 
-Este driver foi desenvolvido com base no projeto de engenharia reversa:
+This driver was developed based on the reverse engineering project:
 
 **[VectorJet/Mali-G77-MC9](https://github.com/VectorJet/Mali-G77-MC9)**
 
 > Reverse-engineering notes and tools for ARM Mali-G77 MC9 GPU driver behavior.
 
-Agradecimento especial ao **VectorJet** pelo trabalho de engenharia reversa que tornou este projeto possível.
+Special thanks to **VectorJet** for the reverse engineering work that made this project possible.
 
-### Tecnologias Utilizadas
+### Technologies Used
 
-- **Mesa 26.2** — Compilador SPIR-V→Valhall v9 (backend Panfrost)
-- **Vulkan API** — Interface gráfica de baixo nível
-- **Linux Kernel** — Interface kbase para GPU Mali
-- **ARM Mali-G68 MC4** — GPU alvo (MediaTek Dimensity 700)
-
----
-
-## Sobre o Projeto
-
-### O que é
-
-Um driver Vulkan ICD (Installable Client Driver) experimental para GPUs ARM Mali, similar ao Turnip para Qualcomm Adreno, mas para arquitetura Valhall v9.
-
-### Capacidades
-
-- Renderização de triângulos via pipeline Vulkan completo
-- Compilador SPIR-V→Valhall funcional (Mesa 26.2)
-- Suporte a ~150 entry points Vulkan
-- Memória e imagens (layout linear, cópia, blit, clear)
-
-### Limitações
-
-- **NÃO roda jogos** (DXVK/VKD3D requerem implementação completa da API)
-- **Não é multi-tile** — processa apenas primeira tile 16x16
-- **Fragilidade** — pode causar JOB_READ_FAULT e reinicialização
-- **SELinux** — página de shader mapeada RW + PROT_EXEC bloqueado
+- **Mesa 26.2** — SPIR-V→Valhall v9 compiler (Panfrost backend)
+- **Vulkan API** — Low-level graphics interface
+- **Linux Kernel** — kbase interface for Mali GPU
+- **ARM Mali-G68 MC4** — Target GPU (MediaTek Dimensity 700)
 
 ---
 
-## Estrutura do Projeto
+## About the Project
+
+### What it is
+
+An experimental Vulkan ICD (Installable Client Driver) for ARM Mali GPUs, similar to Turnip for Qualcomm Adreno, but for Valhall v9 architecture.
+
+### Capabilities
+
+- Triangle rendering via complete Vulkan pipeline
+- Functional SPIR-V→Valhall compiler (Mesa 26.2)
+- ~150 Vulkan entry points supported
+- Memory and images (linear layout, copy, blit, clear)
+
+### Limitations
+
+- **DOES NOT run games** (DXVK/VKD3D require complete API implementation)
+- **Not multi-tile** — processes only first 16x16 tile
+- **Fragility** — may cause JOB_READ_FAULT and reboot
+- **SELinux** — shader page mapped RW + PROT_EXEC blocked
+
+---
+
+## Project Structure
 
 ```
 PanVK-v9-Driver/
-├── src/                    # Código fonte do driver
-│   ├── panvk_v9_*.c/.h    # Entry points e ICD Vulkan
+├── src/                    # Driver source code
+│   ├── panvk_v9_*.c/.h    # Vulkan entry points and ICD
 │   ├── v9_cmd_stream.*    # Command buffer / job chain
-│   ├── v9_pack.h          # Layout dos descritores
-│   ├── pan_kmod_kbase.*   # Backend kbase
-│   └── kbase_winsys.*     # ioctls /dev/mali0
-├── test/                   # Testes e exemplos
-│   ├── test_*.c           # Testes da API Vulkan
-│   ├── dense_map.c        # Render direto
-│   └── ...                # Outros testes
-├── build/                  # Scripts de build e execução
-│   ├── build.sh           # Script de compilação
-│   └── run_*.sh           # Scripts de execução
-├── docs/                   # Documentação
-│   ├── README.md          # Este arquivo
-│   └── REPORT.md          # Relatório técnico
-└── README.md               # Documentação principal
+│   ├── v9_pack.h          # Descriptor layout
+│   ├── pan_kmod_kbase.*   # kbase backend
+│   └── kbase_winsys.*     # /dev/mali0 ioctls
+├── test/                   # Tests and examples
+│   ├── test_*.c           # Vulkan API tests
+│   ├── dense_map.c        # Direct render
+│   └── ...                # Other tests
+├── build/                  # Build and execution scripts
+│   ├── build.sh           # Compilation script
+│   └── run_*.sh           # Execution scripts
+├── docs/                   # Documentation
+│   ├── README.md          # This file
+│   └── REPORT.md          # Technical report
+└── README.md               # Main documentation
 ```
 
 ---
 
-## Pré-requisitos
+## Prerequisites
 
-- **Hardware**: Dispositivo Android com GPU ARM Mali-G68 MC4 (ou similar Valhall v9)
-- **Software**: Termux no Android
-- **Acesso**: Root pode ser necessário para alguns testes
-- **Kernel**: `mali_kbase` (MediaTek r49 ou compatível)
+- **Hardware**: Android device with ARM Mali-G68 MC4 GPU (or similar Valhall v9)
+- **Software**: Termux on Android
+- **Access**: Root may be required for some tests
+- **Kernel**: `mali_kbase` (MediaTek r49 or compatible)
 
 ---
 
-## Instalação
+## Installation
 
-### Compilação
+### Compilation
 
 ```bash
 cd src/
 
-# Biblioteca ICD
+# ICD library
 clang -O2 -shared -fPIC -o libvulkan_panvk_v9.so \
     panvk_v9_entrypoints.c panvk_v9_x11.c \
     v9_cmd_stream.c pan_kmod_kbase.c kbase_winsys.c \
     -ldl -lpthread -lX11 -lxcb
 
-# Compilador (opcional, requer Mesa 26.2)
-# Ver docs/REPORT.md para instruções
+# Compiler (optional, requires Mesa 26.2)
+# See docs/REPORT.md for instructions
 ```
 
-### Configuração
+### Configuration
 
 ```bash
-export VK_ICD_FILENAMES=/caminho/para/vulkan.panvk_v9.json
-export LD_LIBRARY_PATH=/caminho/para:$LD_LIBRARY_PATH
+export VK_ICD_FILENAMES=/path/to/vulkan.panvk_v9.json
+export LD_LIBRARY_PATH=/path/to:$LD_LIBRARY_PATH
 ```
 
 ---
 
-## Uso
+## Usage
 
-### Testes Seguros (sem GPU real)
+### Safe Tests (no real GPU)
 
 ```bash
-PANVK_DRY_RUN=1 ./test_vulkan_loader_icd   # Pipeline completo, CPU only
-PANVK_DRY_RUN=1 ./test_loader_images       # Memória/imagem
+PANVK_DRY_RUN=1 ./test_vulkan_loader_icd   # Complete pipeline, CPU only
+PANVK_DRY_RUN=1 ./test_loader_images       # Memory/image
 ```
 
-### Teste Real (com GPU) — CUIDADO!
+### Real Test (with GPU) — CAUTION!
 
 ```bash
-# APÓS REBOOT do celular, 1 frame único
+# AFTER phone reboot, single frame
 PANVK_DRY_RUN=0 PANVK_SUBMIT_TIMEOUT_MS=1500 V9_SKIP_POST_FLUSH=1 timeout 25 ./dense_map 16 16
 ```
 
-**⚠️ ATENÇÃO**: Testes com GPU real podem causar reinicialização do celular!
+**⚠️ WARNING**: Tests with real GPU may cause phone reboot!
 
 ---
 
-## Variáveis de Ambiente
+## Environment Variables
 
-| Variável | Descrição |
+| Variable | Description |
 |---|---|
-| `PANVK_DRY_RUN=1` | Modo seguro (CPU only, sem /dev/mali0) |
-| `PANVK_DRY_RUN=0` | Usa GPU real (PERIGOSO!) |
-| `PANVK_SUBMIT_TIMEOUT_MS` | Timeout de submit (default 1500ms) |
-| `V9_SKIP_POST_FLUSH=1` | Pula Post-Flush (evita JOB_READ_FAULT) |
-| `PANVK_FS_WORKREG` | Debug: work registers do FS |
-| `PANVK_FORCE_BARRIER` | Debug: força barrier |
+| `PANVK_DRY_RUN=1` | Safe mode (CPU only, no /dev/mali0) |
+| `PANVK_DRY_RUN=0` | Uses real GPU (DANGEROUS!) |
+| `PANVK_SUBMIT_TIMEOUT_MS` | Submit timeout (default 1500ms) |
+| `V9_SKIP_POST_FLUSH=1` | Skips Post-Flush (avoids JOB_READ_FAULT) |
+| `PANVK_FS_WORKREG` | Debug: FS work registers |
+| `PANVK_FORCE_BARRIER` | Debug: force barrier |
 
 ---
 
-## Limitações Técnicas
+## Technical Limitations
 
-1. **Multi-tile**: Processa apenas primeira tile 16x16
-2. **Terminação do fragmento**: Nunca sinaliza 0x1 DONE (comportamento idêntico à referência)
-3. **SELinux**: Página de shader mapeada RW + PROT_EXEC bloqueado
-4. **Não é completo**: Sem swapchain plena, sem extensões Vulkan 1.1+ completas
-5. **GPU fragilidade**: Pode entrar em JOB_READ_FAULT e travar
-
----
-
-## Licença
-
-Este projeto é um estudo/ICD experimental. Uso por sua conta e risco.
+1. **Multi-tile**: Processes only first 16x16 tile
+2. **Fragment termination**: Never signals 0x1 DONE (behavior identical to reference)
+3. **SELinux**: Shader page mapped RW + PROT_EXEC blocked
+4. **Incomplete**: No full swapchain, no complete Vulkan 1.1+ extensions
+5. **GPU fragility**: May enter JOB_READ_FAULT and freeze
 
 ---
 
-## Documentação
+## DXVK/DirectX Game Support (Winlator)
 
-- [docs/README.md](docs/README.md) — Documentação detalhada do driver
-- [docs/REPORT.md](docs/REPORT.md) — Relatório técnico completo
+**Current Status: NOT SUPPORTED**
+
+For running Windows games via DXVK/vkd3d-proton, the following would be needed:
+- Complete swapchain implementation
+- Sync primitives (semaphores, fences)
+- Compute shaders
+- Dynamic state
+- Buffer device address
+- External memory FD
+
+Estimated effort: 4-6 months full-time development.
+
+**Recommendation**: Use the official Mali driver from the device manufacturer for game support.
 
 ---
 
-## Contato
+## License
 
-Para issues ou sugestões, abra uma issue no repositório.
+This project is a study/experimental ICD. Use at your own risk.
 
 ---
 
-**LEMBRE-SE: VOCÊ ASSUME TODA A RESPONSABILIDADE PELO USO DESTE SOFTWARE. O AUTOR NÃO SE RESPONSABILIZA POR QUAISQUER DANOS.**
+## Documentation
+
+- [docs/README.md](docs/README.md) — Detailed driver documentation
+- [docs/REPORT.md](docs/REPORT.md) — Complete technical report
+
+---
+
+## Contact
+
+For issues or suggestions, open an issue in the repository.
+
+---
+
+**REMEMBER: YOU ASSUME ALL RESPONSIBILITY FOR USING THIS SOFTWARE. THE AUTHOR IS NOT RESPONSIBLE FOR ANY DAMAGES.**
