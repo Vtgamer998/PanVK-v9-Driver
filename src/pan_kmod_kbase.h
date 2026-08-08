@@ -66,8 +66,7 @@ int pan_kmod_submit_flush_timeout(struct pan_kmod_dev *dev, uint64_t jc_gpu,
 int pan_kmod_submit_atom_timeout(struct pan_kmod_dev *dev, uint64_t jc_gpu, uint32_t core_req,
                                  uint32_t atom_id, uint32_t *event_code, int timeout_ms);
 int pan_kmod_submit_fragment_timeout(struct pan_kmod_dev *dev, uint64_t jc_gpu, uint32_t core_req,
-                                     uint32_t atom_id, uint32_t *event_code, int timeout_ms,
-                                     int skip_unwedge);
+                                     uint32_t atom_id, uint32_t *event_code, int timeout_ms);
 int pan_kmod_submit_batch(struct pan_kmod_dev *dev, void *atoms, uint32_t nr_atoms);
 int pan_kmod_wait_event(struct pan_kmod_dev *dev, uint32_t *atom_nr, uint32_t *event_code);
 int pan_kmod_wait_event_timeout(struct pan_kmod_dev *dev, uint32_t *atom_nr,

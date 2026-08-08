@@ -251,11 +251,7 @@ static inline void v9_pack_frag_job_chain(uint32_t *fj1, uint32_t *fj2,
     fj2[5] = 1;                        /* Bit 0 = 1 */
     pack_u64(fj2 + 6, 0);              /* Next = NULL */
     fj2[8] = 0;
-    fj2[9] = 0x00030003u;            /* completion-pass tile bound: MUST be the
-                                     * empirically-discovered magic 0x00030003,
-                                     * NOT the framebuffer's computed bound (a 0
-                                     * bound makes FJ2 a no-op on 16x16 and the
-                                     * chain never terminates). */
+    fj2[9] = bound;                    /* completion-pass tile bound: covers all tiles */
     pack_u64(fj2 + 10, mfbd2_gpu | 0x03u);
 
     /* Job 1: Main polygon-list rendering pass */
