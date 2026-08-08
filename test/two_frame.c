@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include "pan_kmod_kbase.h"
 #include "v9_cmd_stream.h"
 
@@ -65,5 +66,10 @@ int main(void) {
     }
     if (reused) v9_cmd_buffer_destroy(reused);
     pan_kmod_dev_destroy(dev);
+    /* Give the kernel kbase driver time to finish MMU page table cleanup and
+     * L2 cache flush before the next execution.  Without this delay, running
+     * ./two_frame twice quickly can cause a memory collision on the GPU MMU
+     * (remapping an area the hardware still considers "in use"). */
+    usleep(2000000); /* 2 seconds */
     return 0;
 }
