@@ -310,7 +310,8 @@ int pan_kmod_submit_flush_timeout(struct pan_kmod_dev *dev, uint64_t jc_gpu,
 }
 
 int pan_kmod_submit_fragment_timeout(struct pan_kmod_dev *dev, uint64_t jc_gpu, uint32_t core_req,
-                                     uint32_t atom_id, uint32_t *event_code, int timeout_ms) {
+                                     uint32_t atom_id, uint32_t *event_code, int timeout_ms,
+                                     int skip_unwedge) {
     if (!dev || !dev->kdev) return -EINVAL;
 
     /* Permanently wedged GPU: stop immediately without opening more fds.
@@ -355,16 +356,18 @@ int pan_kmod_submit_fragment_timeout(struct pan_kmod_dev *dev, uint64_t jc_gpu, 
     if (ret == -EAGAIN) {
         fprintf(stderr, "pan_kmod: fragment atom %u TIMED OUT (timeout=%dms) - GPU may be hung\n",
                 atom_id, timeout_ms);
-        dev->consecutive_failures++;
-        if (dev->consecutive_failures < PAN_KMOD_MAX_CONSECUTIVE_FAILURES) {
-            pan_kmod_dev_reopen(dev);
-        } else {
-            fprintf(stderr,
-                "pan_kmod: %d consecutive failures — GPU permanently wedged, "
-                "writing wedge marker and refusing further submits.\n"
-                "Reboot the device to recover.\n",
-                dev->consecutive_failures);
-            pan_kmod_wedge_set();
+        if (!skip_unwedge) {
+            dev->consecutive_failures++;
+            if (dev->consecutive_failures < PAN_KMOD_MAX_CONSECUTIVE_FAILURES) {
+                pan_kmod_dev_reopen(dev);
+            } else {
+                fprintf(stderr,
+                    "pan_kmod: %d consecutive failures — GPU permanently wedged, "
+                    "writing wedge marker and refusing further submits.\n"
+                    "Reboot the device to recover.\n",
+                    dev->consecutive_failures);
+                pan_kmod_wedge_set();
+            }
         }
         pthread_mutex_unlock(&dev->dev_lock);
         return -ETIMEDOUT;
@@ -380,13 +383,17 @@ int pan_kmod_submit_fragment_timeout(struct pan_kmod_dev *dev, uint64_t jc_gpu, 
          * only fall back to reopen() if that fails.  The render may still
          * have completed — return 0, caller verifies pixels.  The unwedge
          * atom must differ from the REAL fragment atom number (assigned_atom),
-         * not the caller's ignored atom_id hint. */
-        uint8_t uw_atom = (uint8_t)((assigned_atom % 254) + 1);
-        if (uw_atom == assigned_atom)
-            uw_atom = (uint8_t)((uw_atom % 254) + 1);
-        if (kbase_slot_unwedge(dev->kdev, uw_atom, 200) != 0) {
-            fprintf(stderr, "pan_kmod: fragment 0x42 JOB_READ_FAULT - auto-reopening kbase context\n");
-            pan_kmod_dev_reopen(dev);
+         * not the caller's ignored atom_id hint.
+         * When skip_unwedge=1 (FRESH_DEV mode), skip unwedge/reopen since
+         * the caller will destroy+create a fresh device anyway. */
+        if (!skip_unwedge) {
+            uint8_t uw_atom = (uint8_t)((assigned_atom % 254) + 1);
+            if (uw_atom == assigned_atom)
+                uw_atom = (uint8_t)((uw_atom % 254) + 1);
+            if (kbase_slot_unwedge(dev->kdev, uw_atom, 200) != 0) {
+                fprintf(stderr, "pan_kmod: fragment 0x42 JOB_READ_FAULT - auto-reopening kbase context\n");
+                pan_kmod_dev_reopen(dev);
+            }
         }
         pthread_mutex_unlock(&dev->dev_lock);
         return 0;
@@ -407,24 +414,28 @@ int pan_kmod_submit_fragment_timeout(struct pan_kmod_dev *dev, uint64_t jc_gpu, 
          * in <2ms.  After it returns the slot is clean and the next frame
          * can submit immediately without pan_kmod_dev_reopen().  The unwedge
          * atom must differ from the REAL fragment atom number (assigned_atom),
-         * not the caller's ignored atom_id hint. */
-        uint8_t unwedge_atom = (uint8_t)((assigned_atom % 254) + 1);
-        if (unwedge_atom == assigned_atom)
-            unwedge_atom = (uint8_t)((unwedge_atom % 254) + 1);
+         * not the caller's ignored atom_id hint.
+         * When skip_unwedge=1 (FRESH_DEV mode), skip unwedge since the caller
+         * will destroy+create a fresh device anyway. */
+        if (!skip_unwedge) {
+            uint8_t unwedge_atom = (uint8_t)((assigned_atom % 254) + 1);
+            if (unwedge_atom == assigned_atom)
+                unwedge_atom = (uint8_t)((unwedge_atom % 254) + 1);
 
-        int uw = kbase_slot_unwedge(dev->kdev, unwedge_atom, 200);
-        if (uw != 0) {
-            fprintf(stderr,
-                "pan_kmod: slot unwedge failed (%d), falling back to dev_reopen\n", uw);
-            pan_kmod_dev_reopen(dev);
-            /* After dev_reopen the GPU hardware slot may still be wedged
-             * (the MTK r49 GPU shares slots across kbase contexts).  Do NOT
-             * poison here — the render may have actually completed
-             * (TERMINATED means the kernel stopped the job AFTER execution).
-             * The caller (v9_cmd_buffer_submit) verifies pixels and only
-             * sets the permanent wedge marker when the render truly failed
-             * (rendered=false).  Poisoning here would block all subsequent
-             * submits even when the frame rendered successfully. */
+            int uw = kbase_slot_unwedge(dev->kdev, unwedge_atom, 200);
+            if (uw != 0) {
+                fprintf(stderr,
+                    "pan_kmod: slot unwedge failed (%d), falling back to dev_reopen\n", uw);
+                pan_kmod_dev_reopen(dev);
+                /* After dev_reopen the GPU hardware slot may still be wedged
+                 * (the MTK r49 GPU shares slots across kbase contexts).  Do NOT
+                 * poison here — the render may have actually completed
+                 * (TERMINATED means the kernel stopped the job AFTER execution).
+                 * The caller (v9_cmd_buffer_submit) verifies pixels and only
+                 * sets the permanent wedge marker when the render truly failed
+                 * (rendered=false).  Poisoning here would block all subsequent
+                 * submits even when the frame rendered successfully. */
+            }
         }
     }
 
