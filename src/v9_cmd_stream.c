@@ -848,7 +848,7 @@ int v9_cmd_buffer_submit(struct v9_cmd_buffer *cmd) {
     /* 3. Atom 2: Fragment JC (hardware chain Job 1 -> Job 2). 256x256 needs ~8s
      * for MMU warmup; the default 1.5s is too small for multi-tile.  Allow env
      * override (V9_FRAG_TIMEOUT_MS) and fall back to a generous 8000ms. */
-    int frag_timeout = kbase_submit_timeout_ms(400);
+    int frag_timeout = kbase_submit_timeout_ms(8000);
     {
         const char *envt = getenv("V9_FRAG_TIMEOUT_MS");
         if (envt && atoi(envt) > 0) frag_timeout = atoi(envt);
@@ -856,8 +856,7 @@ int v9_cmd_buffer_submit(struct v9_cmd_buffer *cmd) {
     /* When V9_FORCE_CYCLE_DEV=1, skip unwedge inside the fragment submit since
      * the full destroy+create at the end of this function will clean everything.
      * This avoids accumulating ~800ms of unwedge delays per frame. */
-    const char *v9_force_cycle_check = getenv("V9_FORCE_CYCLE_DEV");
-    int skip_unwedge = (v9_force_cycle_check && atoi(v9_force_cycle_check) == 1);
+    int skip_unwedge = 0;
     ret = pan_kmod_submit_fragment_timeout(cmd->dev, cmd->frag_jc_gpu, KBASE_QUEUE_REQ_FRAGMENT, 2, &event_code, frag_timeout, skip_unwedge);
     if (debug_events) printf("panvk: atom 2 FRAGMENT event=0x%x\n", event_code);
     if (ret < 0) {
