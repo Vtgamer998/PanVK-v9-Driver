@@ -1,0 +1,8 @@
+{
+    "ICD": {
+        "api_version": "1.3.0",
+        "library_arch": "64",
+        "library_path": "/data/data/com.winlator/files/rootfs/lib/libvulkan_freedreno.so"
+    },
+    "file_format_version": "1.0.1"
+}

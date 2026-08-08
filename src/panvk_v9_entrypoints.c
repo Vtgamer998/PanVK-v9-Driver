@@ -295,6 +295,10 @@ struct VkQueryPool_T {
     uint32_t query_count;
 };
 
+struct VkSamplerYcbcrConversion_T {
+    uintptr_t loader_data;
+};
+
 struct panvk_compiler_api {
     void *library;
     int (*compile)(const uint32_t *, size_t, enum panvk_v9_shader_stage,
@@ -409,6 +413,9 @@ VkResult vkEnumerateInstanceExtensionProperties(const char *pLayerName, uint32_t
         { .extensionName = VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME, .specVersion = 1 },
         { .extensionName = VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME, .specVersion = 1 },
         { .extensionName = VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME, .specVersion = 1 },
+        { .extensionName = VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME, .specVersion = 1 },
+        { .extensionName = "VK_KHR_win32_surface", .specVersion = 6 },
+        { .extensionName = "VK_WINE_nulldrv_surface", .specVersion = 1 },
     };
     uint32_t num_exts = sizeof(inst_exts) / sizeof(inst_exts[0]);
 
@@ -2318,6 +2325,31 @@ void vkFreeCommandBuffers(VkDevice device, VkCommandPool commandPool, uint32_t c
     }
 }
 
+VkResult vkResetCommandBuffer(VkCommandBuffer commandBuffer, VkCommandBufferResetFlags flags) {
+    if (!commandBuffer) return VK_ERROR_INITIALIZATION_FAILED;
+    if (commandBuffer->v9_cmd) {
+        v9_cmd_buffer_destroy(commandBuffer->v9_cmd);
+        commandBuffer->v9_cmd = NULL;
+    }
+    commandBuffer->rendering_active = false;
+    commandBuffer->graphics_pipeline = NULL;
+    commandBuffer->compute_pipeline = NULL;
+    commandBuffer->viewport_set = false;
+    commandBuffer->scissor_set = false;
+    memset(commandBuffer->descriptor_sets, 0, sizeof(commandBuffer->descriptor_sets));
+    commandBuffer->index_buffer = NULL;
+    commandBuffer->index_offset = 0;
+    commandBuffer->index_type = 0;
+    commandBuffer->push_constants_size = 0;
+    commandBuffer->depth_bias_set = false;
+    return VK_SUCCESS;
+}
+
+VkResult vkResetCommandPool(VkDevice device, VkCommandPool commandPool, VkCommandPoolResetFlags flags) {
+    (void)device; (void)commandPool; (void)flags;
+    return VK_SUCCESS;
+}
+
 VkResult vkCreateEvent(VkDevice device, const struct VkEventCreateInfo *pCreateInfo, const struct VkAllocationCallbacks *pAllocator, VkEvent *pEvent) {
     if (!pEvent) return VK_ERROR_INITIALIZATION_FAILED;
     struct VkEvent_T *e = calloc(1, sizeof(*e));
@@ -3775,6 +3807,54 @@ VKAPI_ATTR void VKAPI_CALL vkCmdSetStencilOpEXT(VkCommandBuffer commandBuffer, V
 }
 
 /* Vulkan ICD Entry Point Lookup Table */
+VkResult vkCreateSamplerYcbcrConversion(VkDevice device, const VkSamplerYcbcrConversionCreateInfo *pCreateInfo, const VkAllocationCallbacks *pAllocator, VkSamplerYcbcrConversion *pYcbcrConversion) {
+    (void)device; (void)pCreateInfo; (void)pAllocator;
+    struct VkSamplerYcbcrConversion_T *conv = calloc(1, sizeof(*conv));
+    if (!conv) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    set_loader_magic(conv);
+    *pYcbcrConversion = conv;
+    return VK_SUCCESS;
+}
+
+VkResult vkCreateSamplerYcbcrConversionKHR(VkDevice device, const VkSamplerYcbcrConversionCreateInfo *pCreateInfo, const VkAllocationCallbacks *pAllocator, VkSamplerYcbcrConversion *pYcbcrConversion) {
+    return vkCreateSamplerYcbcrConversion(device, pCreateInfo, pAllocator, pYcbcrConversion);
+}
+
+void vkDestroySamplerYcbcrConversion(VkDevice device, VkSamplerYcbcrConversion ycbcrConversion, const VkAllocationCallbacks *pAllocator) {
+    (void)device; (void)pAllocator;
+    free(ycbcrConversion);
+}
+
+void vkDestroySamplerYcbcrConversionKHR(VkDevice device, VkSamplerYcbcrConversion ycbcrConversion, const VkAllocationCallbacks *pAllocator) {
+    vkDestroySamplerYcbcrConversion(device, ycbcrConversion, pAllocator);
+}
+
+void vkGetDescriptorSetLayoutSupport(VkDevice device, const VkDescriptorSetLayoutCreateInfo *pCreateInfo, VkDescriptorSetLayoutSupport *pSupport) {
+    (void)device; (void)pCreateInfo;
+    pSupport->supported = VK_TRUE;
+}
+
+void vkGetDescriptorSetLayoutSupportKHR(VkDevice device, const VkDescriptorSetLayoutCreateInfo *pCreateInfo, VkDescriptorSetLayoutSupport *pSupport) {
+    vkGetDescriptorSetLayoutSupport(device, pCreateInfo, pSupport);
+}
+
+VkResult vkGetDeviceGroupSurfacePresentModesKHR(VkDevice device, VkSurfaceKHR surface, uint32_t *pModes) {
+    (void)device; (void)surface;
+    *pModes = VK_DEVICE_GROUP_PRESENT_MODE_LOCAL_BIT_KHR;
+    return VK_SUCCESS;
+}
+
+VkResult vkGetPipelineCacheData(VkDevice device, VkPipelineCache pipelineCache, size_t *pDataSize, void *pData) {
+    (void)device; (void)pipelineCache;
+    if (pDataSize) *pDataSize = 0;
+    return VK_SUCCESS;
+}
+
+VkResult vkMergePipelineCaches(VkDevice device, VkPipelineCache dstCache, uint32_t srcCacheCount, const VkPipelineCache *pSrcCaches) {
+    (void)device; (void)dstCache; (void)srcCacheCount; (void)pSrcCaches;
+    return VK_SUCCESS;
+}
+
 PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance instance, const char *pName) {
     if (!pName) return NULL;
 #define MATCH(name) if (strcmp(pName, #name) == 0) return (PFN_vkVoidFunction)name
@@ -3997,6 +4077,17 @@ PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance instance, const char *pName)
     MATCH(vkCmdSetStencilTestEnableEXT);
     MATCH(vkCmdSetStencilOpEXT);
     MATCH(panvk_v9_read_pixel);
+    MATCH(vkResetCommandBuffer);
+    MATCH(vkResetCommandPool);
+    MATCH(vkCreateSamplerYcbcrConversion);
+    MATCH(vkDestroySamplerYcbcrConversion);
+    MATCH(vkCreateSamplerYcbcrConversionKHR);
+    MATCH(vkDestroySamplerYcbcrConversionKHR);
+    MATCH(vkGetDescriptorSetLayoutSupport);
+    MATCH(vkGetDescriptorSetLayoutSupportKHR);
+    MATCH(vkGetDeviceGroupSurfacePresentModesKHR);
+    MATCH(vkGetPipelineCacheData);
+    MATCH(vkMergePipelineCaches);
 #undef MATCH
     return NULL;
 }
