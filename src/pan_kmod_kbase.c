@@ -41,6 +41,8 @@ static void pan_kmod_wedge_set(void) {
     if (f) { fprintf(f, "GPU wedged\n"); fclose(f); }
 }
 static void pan_kmod_wedge_clear(void) { unlink(PAN_KMOD_WEDGE_FILE); }
+
+struct pan_kmod_dev {
     struct kbase_dev *kdev;
     struct pan_kmod_dev_props props;
     /* Serialises every access to dev->kdev (including pan_kmod_dev_reopen
