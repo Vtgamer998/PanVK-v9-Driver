@@ -853,11 +853,9 @@ int v9_cmd_buffer_submit(struct v9_cmd_buffer *cmd) {
         const char *envt = getenv("V9_FRAG_TIMEOUT_MS");
         if (envt && atoi(envt) > 0) frag_timeout = atoi(envt);
     }
-    /* When V9_FORCE_CYCLE_DEV=1, skip unwedge inside the fragment submit since
-     * the full destroy+create at the end of this function will clean everything.
-     * This avoids accumulating ~800ms of unwedge delays per frame. */
-    const char *v9_force_cycle_check = getenv("V9_FORCE_CYCLE_DEV");
-    int skip_unwedge = (v9_force_cycle_check && atoi(v9_force_cycle_check) == 1);
+    /* Always skip unwedge since the automatic device cycle at end of submit
+     * will clean everything.  This avoids accumulating ~800ms unwedge delays. */
+    int skip_unwedge = 1;
     ret = pan_kmod_submit_fragment_timeout(cmd->dev, cmd->frag_jc_gpu, KBASE_QUEUE_REQ_FRAGMENT, 2, &event_code, frag_timeout, skip_unwedge);
     if (debug_events) printf("panvk: atom 2 FRAGMENT event=0x%x\n", event_code);
     if (ret < 0) {
@@ -948,46 +946,14 @@ int v9_cmd_buffer_submit(struct v9_cmd_buffer *cmd) {
         return 0;
     }
     const char *v9_force_cycle = getenv("V9_FORCE_CYCLE_DEV");
-    /* When V9_FORCE_CYCLE_DEV=1, skip post-flush since the destroy+create will
-     * clean everything anyway.  The post-flush after a TERMINATED fragment can
-     * trigger 0x40 SOFT_STOPPED → 0x42 JOB_READ_FAULT → 200ms unwedge delay.
-     * With FRESH_DEV this is wasted time. */
-    if (v9_force_cycle && atoi(v9_force_cycle) == 1) {
-        if (debug_events) printf("panvk: Post-Flush SKIPPED (V9_FORCE_CYCLE_DEV=1)\n");
-        /* Skip straight to destroy+create below. */
-    } else {
-    /* 4. Atom 3: Post-Flush (drain after fragment completes).  Must be
-     * best-effort: the render already completed by this point, so a stall
-     * here (e.g. the kernel read-faults the atom after a TERMINATED fragment)
-     * must NOT poison the device / mark the GPU as wedged -- that would make
-     * a successful frame un-retryable on the very next frame.
-     *
-     * 0x42 (JOB_READ_FAULT) after a TERMINATED fragment is expected: the
-     * fragment slot is still marked "in use" by the kernel.  Accept it as
-     * success — the slot will be cleaned by the next frame's unwedge or
-     * FRESH_DEV destroy+create. */
-    v9_pack_flush_job((uint32_t *)(base_cpu + (cmd->flush_jc_gpu - cmd->mem_bo->gpu)));
-    uint32_t post_code = 0;
-    int sr = pan_kmod_submit_flush_timeout(cmd->dev, cmd->flush_jc_gpu, 1, &post_code,
-                                           kbase_submit_timeout_ms(400));
-    if (debug_events) printf("panvk: atom 3 POST-FLUSH event=0x%x\n", post_code);
-    if (sr != 0 || (post_code != 0x1 && post_code != 0x42)) {
-        fprintf(stderr, "v9_cmd_buffer_submit: Post-Flush warning (ret=%d, event=0x%x) - render completed\n",
-                sr, post_code);
-    }
-    }
+    /* AUTOMATIC DEVICE CYCLE: always destroy+create between frames to prevent
+     * the MTK r49 wedged-slot issue.  Without this, the second frame read-faults
+     * because the kernel leaves fragment slots "in use" after completion.
+     * The V9_FORCE_CYCLE_DEV env var can disable this (set to 0) for debugging. */
+    int do_cycle = 1;
+    if (v9_force_cycle && atoi(v9_force_cycle) == 0) do_cycle = 0;
 
-    /* Slot unwedge is now handled inside pan_kmod_submit_fragment_timeout:
-     * it calls kbase_slot_unwedge() after every TERMINATED/CANCELLED fragment,
-     * and falls back to pan_kmod_dev_reopen() if the unwedge fails.
-     *
-     * V9_FORCE_CYCLE_DEV=1: full destroy+create between frames.  The reopen
-     * only resets the kbase context but leaves the GPU hardware slot wedged;
-     * a full pan_kmod_dev_destroy + pan_kmod_dev_create forces the kernel to
-     * release ALL resources (fd close triggers kbase_context_destroy which
-     * resets the physical slot).  BOs mapped with SAME_VA persist across the
-     * destroy because Linux mmap is reference-counted. */
-    if (v9_force_cycle && atoi(v9_force_cycle) == 1) {
+    if (do_cycle) {
         if (cmd->dev) {
             uint32_t saved_gpu_id = pan_kmod_dev_query_props_gpu_id(cmd->dev);
             pan_kmod_dev_destroy(cmd->dev);
@@ -996,11 +962,11 @@ int v9_cmd_buffer_submit(struct v9_cmd_buffer *cmd) {
                 pan_kmod_dev_set_gpu_id(cmd->dev, saved_gpu_id);
             }
             if (!cmd->dev) {
-                fprintf(stderr, "v9_cmd_buffer_submit: V9_FORCE_CYCLE_DEV failed - dev re-create returned NULL\n");
+                fprintf(stderr, "v9_cmd_buffer_submit: auto device cycle failed - dev re-create returned NULL\n");
                 return -ENODEV;
             }
             if (debug_events)
-                fprintf(stderr, "v9_cmd_buffer_submit: V9_FORCE_CYCLE_DEV full destroy+create done\n");
+                fprintf(stderr, "v9_cmd_buffer_submit: auto device cycle done\n");
         }
     }
     return 0;
