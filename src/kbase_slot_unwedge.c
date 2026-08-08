@@ -125,12 +125,8 @@ int kbase_slot_unwedge(struct kbase_dev *dev, uint8_t atom_nr, int timeout_ms) {
         return ret;
     }
 
-    /* 0x1 DONE = clean.  0x4 TERMINATED = also acceptable on some kernels.
-     * 0x40 SOFT_STOPPED = the kernel soft-stopped the null flush itself;
-     * this is actually the EXPECTED outcome since the null flush's purpose
-     * is to trigger kbase_job_slot_softstop() on the fragment slot.  Accept
-     * it as success — the slot is released after soft-stop. */
-    if (rx_code == 0x1 || rx_code == 0x4 || rx_code == 0x40) {
+    /* 0x1 DONE = clean.  0x4 TERMINATED = also acceptable on some kernels. */
+    if (rx_code == 0x1 || rx_code == 0x4) {
         fprintf(stderr,
             "kbase_slot_unwedge: OK — fragment slot released "
             "(null flush code=0x%x atom=%u)\n",
