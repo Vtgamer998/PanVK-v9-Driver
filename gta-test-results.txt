@@ -1,0 +1,5 @@
+[GTA-TEST] ============================================
+[GTA-TEST]  GTA V Vulkan Requirement Test (PanVK-v9)
+[GTA-TEST] ============================================
+[GTA-TEST] 
+[GTA-TEST] ERRO: vkCreateInstance falhou (-9)
