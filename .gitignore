@@ -1,5 +1,4 @@
 # Binários compilados
-*.so
 *.o
 
 # Logs
