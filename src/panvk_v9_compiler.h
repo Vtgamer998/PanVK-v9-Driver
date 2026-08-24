@@ -46,6 +46,14 @@ struct panvk_v9_compiled_shader {
      * that are not constants (e.g. UBO relocations) are zeroed here. */
     uint32_t fau_count;
     uint32_t fau_consts[128];
+    /* Number of 32-bit FAU words reserved at the start of the FAU for
+     * sysvals + user push constants (an 8-byte chunk occupies 2 words).
+     * Immediates/promoted constants never overlap this range. */
+    uint32_t fau_reserved;
+    /* Used user push-constant 8-byte chunks, byte-offsets listed in packed
+     * (prefix-sum) order: chunk j occupies FAU 32-bit words [2j, 2j+2). */
+    uint32_t fau_push_count;
+    uint32_t fau_push_chunks[32];
 };
 
 struct panvk_v9_descriptor_binding {

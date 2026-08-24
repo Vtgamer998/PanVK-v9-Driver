@@ -46,6 +46,27 @@ struct v9_attribute_binding {
     uint32_t buffer_size;
 };
 
+struct v9_texture_binding {
+    uint64_t image_gpu; /* base address of image data */
+    uint32_t width;
+    uint32_t height;
+    uint32_t format; /* VkFormat */
+    uint32_t view_type;
+    uint32_t row_stride;
+    uint32_t index; /* descriptor index within texture heap */
+};
+
+struct v9_sampler_binding {
+    uint32_t mag_filter;
+    uint32_t min_filter;
+    uint32_t mipmap_mode;
+    uint32_t wrap_s;
+    uint32_t wrap_t;
+    uint32_t wrap_r;
+    uint32_t max_anisotropy;
+    uint32_t index;
+};
+
 struct v9_cmd_buffer *v9_cmd_buffer_create(struct pan_kmod_dev *dev,
                                            const struct v9_render_target_config *config);
 struct v9_cmd_buffer *v9_cmd_buffer_ref(struct v9_cmd_buffer *cmd);
@@ -58,12 +79,20 @@ int v9_cmd_buffer_set_fragment_shader(struct v9_cmd_buffer *cmd,
                                       const struct panvk_v9_compiled_shader *shader);
 int v9_cmd_buffer_set_compute_shader(struct v9_cmd_buffer *cmd,
                                      const struct panvk_v9_compiled_shader *shader);
+int v9_cmd_buffer_set_push_constants(struct v9_cmd_buffer *cmd,
+                                     const uint8_t *data, uint32_t size);
 int v9_cmd_buffer_set_ubos(struct v9_cmd_buffer *cmd,
                            const struct v9_ubo_binding *bindings,
                            uint32_t binding_count);
 int v9_cmd_buffer_set_ssbos(struct v9_cmd_buffer *cmd,
                             const struct v9_ssbo_binding *bindings,
                             uint32_t binding_count);
+int v9_cmd_buffer_set_textures(struct v9_cmd_buffer *cmd,
+                               const struct v9_texture_binding *bindings,
+                               uint32_t binding_count);
+int v9_cmd_buffer_set_samplers(struct v9_cmd_buffer *cmd,
+                               const struct v9_sampler_binding *bindings,
+                               uint32_t binding_count);
 int v9_cmd_buffer_dispatch(struct v9_cmd_buffer *cmd,
                            uint32_t count_x, uint32_t count_y, uint32_t count_z);
 int v9_cmd_buffer_set_attributes(struct v9_cmd_buffer *cmd,
@@ -90,6 +119,7 @@ uint64_t v9_cmd_buffer_get_frag_jc_gpu(struct v9_cmd_buffer *cmd);
 uint64_t v9_cmd_buffer_get_polylist_gpu(struct v9_cmd_buffer *cmd);
 uint64_t v9_cmd_buffer_get_ssbo_gpu(struct v9_cmd_buffer *cmd);
 bool v9_cmd_buffer_has_compute(struct v9_cmd_buffer *cmd);
+void v9_cmd_buffer_update_config(struct v9_cmd_buffer *cmd, uint32_t width, uint32_t height, uint32_t clear_color);
 void *v9_cmd_buffer_get_mem_cpu(struct v9_cmd_buffer *cmd);
 uint64_t v9_cmd_buffer_get_mem_gpu(struct v9_cmd_buffer *cmd);
 struct pan_kmod_dev *v9_cmd_buffer_get_dev(struct v9_cmd_buffer *cmd);

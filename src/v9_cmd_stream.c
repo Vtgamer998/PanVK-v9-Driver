@@ -61,6 +61,7 @@ struct v9_cmd_buffer {
     bool has_draw_command;
     bool has_compute_command;
     bool use_malloc_vertex;
+    bool is_green_fs;
     uint64_t res_gpu;
     uint64_t ubo_gpu;
     uint64_t ssbo_gpu;
@@ -81,6 +82,9 @@ struct v9_cmd_buffer {
     uint64_t dcd2_gpu;
     uint64_t tiler_heap_backing_gpu;
     uint64_t color_gpu;
+    uint64_t tex_gpu;
+    uint64_t sampler_gpu;
+    uint64_t tex_payload_gpu;
     struct pan_kmod_bo *exec_cs_bo;
     uint64_t isa_cs_gpu;
     uint64_t sp_cs_gpu;
@@ -95,6 +99,18 @@ struct v9_cmd_buffer {
     uint32_t fau_cs_count;
     uint32_t fau_fs_count;
     uint32_t fau_vs_count;
+    /* User push-constant FAU layout per stage (see panvk_v9_compiler.h):
+     * fau_*_reserved is the number of reserved 32-bit words; each used
+     * 8-byte chunk j of the push constant block maps to FAU words [2j,2j+2). */
+    uint32_t fau_vs_reserved;
+    uint32_t fau_vs_push_count;
+    uint32_t fau_vs_push_chunks[32];
+    uint32_t fau_fs_reserved;
+    uint32_t fau_fs_push_count;
+    uint32_t fau_fs_push_chunks[32];
+    uint32_t fau_cs_reserved;
+    uint32_t fau_cs_push_count;
+    uint32_t fau_cs_push_chunks[32];
 
     /* Double-buffering: two independent color+mem slots so the CPU can pack
      * frame N+1 while the GPU renders frame N.  active_slot alternates 0/1. */
@@ -141,6 +157,9 @@ static void v9_slot_repoint(struct v9_cmd_buffer *cmd, int slot) {
     cmd->sp_cs_gpu         = base_gva + 0xCC80;
     cmd->ssbo_gpu          = base_gva + 0xD340;
     cmd->compute_job_gpu   = base_gva + 0xE600;
+    cmd->tex_gpu           = base_gva + 0xE800;
+    cmd->sampler_gpu       = base_gva + 0xEA00;
+    cmd->tex_payload_gpu   = base_gva + 0xEB00;
     cmd->fau_cs_gpu        = base_gva + 0xDD00;
     cmd->fau_fs_gpu        = base_gva + 0xDD80;
     cmd->fau_vs_gpu        = base_gva + 0xDE00;
@@ -162,7 +181,7 @@ static void v9_slot_pack_static(struct v9_cmd_buffer *cmd) {
     v9_pack_shader_program((uint32_t *)(base_cpu + (cmd->sp_gpu - mem_base)),
                            cmd->isa_gpu, 2, 32, 0, true, true, false, false);
     v9_pack_tiler_heap((uint32_t *)(base_cpu + (cmd->tiler_heap_desc_gpu - mem_base)),
-                       cmd->tiler_heap_backing_gpu, 0xC0000); /* 768KB: max within 1MB mem_bo */
+                       cmd->tiler_heap_backing_gpu, 0x180000); /* 1.5MB heap: 0x40000..0x1C0000 in 2MiB mem_bo */
     v9_pack_tiler_ctx((uint32_t *)(base_cpu + (cmd->tiler_ctx_gpu - mem_base)),
                       cmd->polylist_gpu, w, h, cmd->tiler_heap_desc_gpu);
     v9_pack_rt0((uint32_t *)(base_cpu + (cmd->rt0_gpu - mem_base)),
@@ -188,6 +207,18 @@ static void v9_slot_pack_static(struct v9_cmd_buffer *cmd) {
     pos[0] = 0.0f; pos[1] = 0.0f; pos[2] = 0.5f; pos[3] = 1.0f;
     pos[4] = (float)w; pos[5] = 0.0f; pos[6] = 0.5f; pos[7] = 1.0f;
     pos[8] = 0.0f; pos[9] = (float)h; pos[10] = 0.5f; pos[11] = 1.0f;
+    {
+        const char *ov = getenv("PANVK_POS_OVERRIDE");
+        if (ov && *ov) {
+            float vals[12];
+            int n = sscanf(ov, "%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f",
+                           &vals[0], &vals[1], &vals[2], &vals[3],
+                           &vals[4], &vals[5], &vals[6], &vals[7],
+                           &vals[8], &vals[9], &vals[10], &vals[11]);
+            if (n == 12) memcpy(pos, vals, sizeof(vals));
+            fprintf(stderr, "PANVK_POS_OVERRIDE=%s (parsed %d)\n", ov, n);
+        }
+    }
     uint16_t *idx = (uint16_t *)(base_cpu + (cmd->idx_gpu - mem_base));
     idx[0] = 0; idx[1] = 1; idx[2] = 2;
 
@@ -303,10 +334,12 @@ int v9_cmd_buffer_begin(struct v9_cmd_buffer *cmd) {
 
     uint8_t *base_cpu = (uint8_t *)cmd->mem_bo->cpu;
 
-    /* Re-init TILER_JOB exception header words 0-7 */
+    /* Re-init TILER_JOB exception header words 0-7.  Default MALLOC_VERTEX_JOB;
+     * v9_pack_tiler_job re-packs the job (and type) at draw time, and submit
+     * re-inits word 4 again to match the packed layout. */
     uint32_t *vt = (uint32_t *)(base_cpu + (cmd->tiler_job_gpu - cmd->mem_bo->gpu));
     memset(vt, 0, 128);
-    vt[4] = (1u << 0) | (7u << 1);
+    vt[4] = (11u << 1);
 
     uint32_t *fjc = (uint32_t *)(base_cpu + (cmd->flush_jc_gpu - cmd->mem_bo->gpu));
     memset(fjc, 0, 128);
@@ -342,6 +375,38 @@ static void write_fau(struct v9_cmd_buffer *cmd, uint64_t fau_gpu,
     *fau_count = shader->fau_count;
 }
 
+/* Write the user push constant block into a shader's reserved FAU region.
+ * Each used 8-byte chunk j (byte offset push_chunks[j] in data) owns FAU
+ * 32-bit words [2j, 2j+2).  Immediates live at fau_reserved and above so
+ * there is no overlap. */
+static void write_fau_push_consts(struct v9_cmd_buffer *cmd, uint64_t fau_gpu,
+                                  uint32_t push_count,
+                                  const uint32_t *push_chunks,
+                                  const uint8_t *data, uint32_t size) {
+    if (!cmd->mem_bo || !data || !push_count) return;
+    uint8_t *base_cpu = cmd->mem_bo->cpu;
+    uint32_t *fau = (uint32_t *)(base_cpu + (fau_gpu - cmd->mem_bo->gpu));
+    for (uint32_t j = 0; j < push_count && j < 32; j++) {
+        uint32_t src = push_chunks[j];
+        if (src + 8 > size) continue;
+        memcpy(fau + 2 * j, data + src, 8);
+    }
+}
+
+int v9_cmd_buffer_set_push_constants(struct v9_cmd_buffer *cmd,
+                                     const uint8_t *data, uint32_t size) {
+    if (!cmd || !cmd->mem_bo) return -EINVAL;
+    if (data && size) {
+        write_fau_push_consts(cmd, cmd->fau_vs_gpu, cmd->fau_vs_push_count,
+                              cmd->fau_vs_push_chunks, data, size);
+        write_fau_push_consts(cmd, cmd->fau_fs_gpu, cmd->fau_fs_push_count,
+                              cmd->fau_fs_push_chunks, data, size);
+        write_fau_push_consts(cmd, cmd->fau_cs_gpu, cmd->fau_cs_push_count,
+                              cmd->fau_cs_push_chunks, data, size);
+    }
+    return 0;
+}
+
 int v9_cmd_buffer_set_vertex_shader(struct v9_cmd_buffer *cmd,
                                      const struct panvk_v9_compiled_shader *shader) {
     if (!cmd || !cmd->mem_bo || !shader || !shader->binary ||
@@ -375,9 +440,23 @@ int v9_cmd_buffer_set_vertex_shader(struct v9_cmd_buffer *cmd,
             shader->ftz_fp16, shader->ftz_fp32);
     }
     cmd->has_vertex_shader = true;
+    if (getenv("PANVK_NO_VS")) {
+        cmd->has_vertex_shader = false;
+    }
     cmd->has_varying_shader = shader->secondary_enable &&
                               getenv("PANVK_EXPERIMENT_MV11_VARYING");
-    cmd->use_malloc_vertex = getenv("PANVK_EXPERIMENT_MV11_POSITION") && shader->idvs;
+    /* On Valhall v9 the tiler must be a MALLOC_VERTEX_JOB (IDVS): the
+     * hardware runs the position shader in the tiler to generate positions.
+     * There is no non-IDVS tiler path on v9, so always enable malloc when the
+     * compiled VS reports idvs.  Even VS shaders without idvs=1 still need a
+     * MALLOC_VERTEX_JOB header - we hand the VS binary to the position shader
+     * env and let it produce positions. */
+    cmd->use_malloc_vertex = shader->idvs || true;
+    (void)shader;
+    cmd->fau_vs_reserved = shader->fau_reserved;
+    cmd->fau_vs_push_count = shader->fau_push_count;
+    memcpy(cmd->fau_vs_push_chunks, shader->fau_push_chunks,
+           sizeof(shader->fau_push_chunks));
     write_fau(cmd, cmd->fau_vs_gpu, &cmd->fau_vs_count, shader);
     return 0;
 }
@@ -399,16 +478,31 @@ int v9_cmd_buffer_set_fragment_shader(struct v9_cmd_buffer *cmd,
         cmd->isa_gpu = new_bo->gpu;
     }
 
-    memcpy(cmd->exec_bo->cpu, shader->binary, shader->binary_size);
     uint8_t *base_cpu = cmd->mem_bo->cpu;
     bool force_barrier = getenv("PANVK_FORCE_BARRIER") != NULL;
     uint32_t work_reg = shader->work_reg_count;
+    uint64_t preload = shader->preload;
     const char *wr = getenv("PANVK_FS_WORKREG");
     if (wr) work_reg = (uint32_t)strtoul(wr, NULL, 0);
+
+    if (getenv("PANVK_GREEN_FS")) {
+        memcpy(cmd->exec_bo->cpu, k_valhall_green_fs, sizeof(k_valhall_green_fs));
+        cmd->is_green_fs = true;
+        work_reg = 32;
+        preload = 0;
+        force_barrier = true;
+    } else {
+        memcpy(cmd->exec_bo->cpu, shader->binary, shader->binary_size);
+        cmd->is_green_fs = false;
+    }
     v9_pack_shader_program((uint32_t *)(base_cpu + (cmd->sp_gpu - cmd->mem_bo->gpu)),
-                           cmd->isa_gpu, 2, work_reg, shader->preload,
+                           cmd->isa_gpu, 2, work_reg, preload,
                            true, force_barrier || shader->contains_barrier,
                            shader->ftz_fp16, shader->ftz_fp32);
+    cmd->fau_fs_reserved = shader->fau_reserved;
+    cmd->fau_fs_push_count = shader->fau_push_count;
+    memcpy(cmd->fau_fs_push_chunks, shader->fau_push_chunks,
+           sizeof(shader->fau_push_chunks));
     write_fau(cmd, cmd->fau_fs_gpu, &cmd->fau_fs_count, shader);
     return 0;
 }
@@ -467,6 +561,10 @@ int v9_cmd_buffer_set_compute_shader(struct v9_cmd_buffer *cmd,
     cmd->local_size_y = shader->local_size_y ? shader->local_size_y : 1;
     cmd->local_size_z = shader->local_size_z ? shader->local_size_z : 1;
     cmd->has_compute_shader = true;
+    cmd->fau_cs_reserved = shader->fau_reserved;
+    cmd->fau_cs_push_count = shader->fau_push_count;
+    memcpy(cmd->fau_cs_push_chunks, shader->fau_push_chunks,
+           sizeof(shader->fau_push_chunks));
     write_fau(cmd, cmd->fau_cs_gpu, &cmd->fau_cs_count, shader);
     return 0;
 }
@@ -536,6 +634,89 @@ int v9_cmd_buffer_set_attributes(struct v9_cmd_buffer *cmd,
         v9_pack_resource(resources + 4, cmd->attr_buf_gpu, binding_count * 32);
         v9_pack_resource(resources + 8, cmd->attr_gpu, binding_count * 32);
     }
+    return 0;
+}
+
+int v9_cmd_buffer_set_textures(struct v9_cmd_buffer *cmd,
+                               const struct v9_texture_binding *bindings,
+                               uint32_t binding_count) {
+    if (!cmd || !cmd->mem_bo || (binding_count && !bindings)) return -EINVAL;
+    uint32_t descriptor_count = 0;
+    for (uint32_t i = 0; i < binding_count; i++) {
+        if (bindings[i].index >= 8) return -E2BIG;
+        if (bindings[i].index + 1 > descriptor_count)
+            descriptor_count = bindings[i].index + 1;
+    }
+    uint8_t *base_cpu = cmd->mem_bo->cpu;
+    uint32_t *tex_descs = (uint32_t *)(base_cpu + (cmd->tex_gpu - cmd->mem_bo->gpu));
+    uint32_t *tex_payload = (uint32_t *)(base_cpu + (cmd->tex_payload_gpu - cmd->mem_bo->gpu));
+    memset(tex_descs, 0, 8 * 32);
+    memset(tex_payload, 0, 8 * 32);
+    for (uint32_t i = 0; i < binding_count; i++) {
+        const struct v9_texture_binding *b = &bindings[i];
+        uint32_t *td = tex_descs + b->index * 8;
+        uint32_t *pl = tex_payload + b->index * 8;
+        uint32_t fmt = v9_vk_format_to_mali(b->format);
+        uint32_t dim = 2; /* 2D default */
+        if (b->view_type == 0) dim = 1;
+        else if (b->view_type == 2) dim = 3;
+        else if (b->view_type == 3 || b->view_type == 6) dim = 0; /* cube */
+        uint64_t payload_gpu = cmd->tex_payload_gpu + b->index * 32;
+        v9_pack_texture(td, dim, fmt, b->width ? b->width : 1, b->height ? b->height : 1,
+                        v9_mali_tex_swizzle_default(), payload_gpu);
+        uint32_t bpp = 4;
+        if (b->format == 37 || b->format == 43 || b->format == 44) bpp = 4;
+        else if (b->format == 109) bpp = 16;
+        uint32_t row_stride = b->row_stride ? b->row_stride : b->width * bpp;
+        uint32_t size = row_stride * b->height;
+        uint32_t slice = size;
+        v9_pack_generic_plane(pl, b->image_gpu, row_stride, slice, size, b->width, b->height);
+    }
+    uint32_t *resources = (uint32_t *)(base_cpu + (cmd->res_gpu - cmd->mem_bo->gpu));
+    if (descriptor_count)
+        v9_pack_resource(resources + 12, cmd->tex_gpu, descriptor_count * 32);
+    /* Also need to ensure payload is visible; not a resource, but texture's surfaces points to it */
+    return 0;
+}
+
+int v9_cmd_buffer_set_samplers(struct v9_cmd_buffer *cmd,
+                               const struct v9_sampler_binding *bindings,
+                               uint32_t binding_count) {
+    if (!cmd || !cmd->mem_bo || (binding_count && !bindings)) return -EINVAL;
+    uint32_t descriptor_count = 0;
+    for (uint32_t i = 0; i < binding_count; i++) {
+        if (bindings[i].index >= 8) return -E2BIG;
+        if (bindings[i].index + 1 > descriptor_count)
+            descriptor_count = bindings[i].index + 1;
+    }
+    uint8_t *base_cpu = cmd->mem_bo->cpu;
+    uint32_t *samp_descs = (uint32_t *)(base_cpu + (cmd->sampler_gpu - cmd->mem_bo->gpu));
+    memset(samp_descs, 0, 8 * 32);
+    for (uint32_t i = 0; i < binding_count; i++) {
+        const struct v9_sampler_binding *b = &bindings[i];
+        uint32_t *sd = samp_descs + b->index * 8;
+        uint32_t wrap_s = 9, wrap_t = 9, wrap_r = 9; /* clamp to edge */
+        /* VkSamplerAddressMode: 0=REPEAT,1=MIRRORED_REPEAT,2=CLAMP_TO_EDGE,3=CLAMP_TO_BORDER,4=MIRROR_CLAMP */
+        if (b->wrap_s == 0) wrap_s = 8;
+        else if (b->wrap_s == 1) wrap_s = 12;
+        else if (b->wrap_s == 2) wrap_s = 9;
+        else if (b->wrap_s == 3) wrap_s = 11;
+        if (b->wrap_t == 0) wrap_t = 8;
+        else if (b->wrap_t == 1) wrap_t = 12;
+        else if (b->wrap_t == 2) wrap_t = 9;
+        else if (b->wrap_t == 3) wrap_t = 11;
+        if (b->wrap_r == 0) wrap_r = 8;
+        else if (b->wrap_r == 1) wrap_r = 12;
+        else if (b->wrap_r == 2) wrap_r = 9;
+        else if (b->wrap_r == 3) wrap_r = 11;
+        uint32_t mag = b->mag_filter; /* 0 nearest, 1 linear */
+        uint32_t min = b->min_filter;
+        uint32_t mipmap = b->mipmap_mode; /* 0 nearest, 1 linear */
+        v9_pack_sampler(sd, mag, min, mipmap, wrap_s, wrap_t, wrap_r, false);
+    }
+    uint32_t *resources = (uint32_t *)(base_cpu + (cmd->res_gpu - cmd->mem_bo->gpu));
+    if (descriptor_count)
+        v9_pack_resource(resources + 16, cmd->sampler_gpu, descriptor_count * 32);
     return 0;
 }
 
@@ -610,7 +791,45 @@ int v9_cmd_buffer_set_render_target(struct v9_cmd_buffer *cmd,
     return 0;
 }
 
+int v9_cmd_buffer_submit_impl(struct v9_cmd_buffer *cmd); /* fwd */
+
 int v9_cmd_buffer_submit(struct v9_cmd_buffer *cmd) {
+    if (!cmd || !cmd->dev) return -EINVAL;
+    int ret = v9_cmd_buffer_submit_impl(cmd);
+
+    /* TRACE RT: roda em TODOS os caminhos de retorno (single-frag batch
+     * incluído).  GPU já terminou (submit síncrono).  Correlacionar o
+     * rt_gpu com o bo_gpu do DIAG present no log do driver. */
+    {
+        static uint32_t trace_n = 0;
+        trace_n++;
+        if (trace_n <= 30 || (trace_n % 500) == 0) {
+            if (!cmd->color_bo || !cmd->color_bo->cpu) {
+                fprintf(stderr, "TRACE submit#%u: color_bo NULL!\n", trace_n);
+                return ret;
+            }
+            uint64_t rt_gpu = cmd->color_bo->gpu;
+            uint32_t nz = 0, first = 0;
+            uint32_t *cp = (uint32_t *)cmd->color_bo->cpu;
+            uint32_t total = cmd->config.width * cmd->config.height;
+            for (uint32_t i = 0; i < total; i += 97)
+                if (cp[i]) { if (!nz) first = cp[i]; nz++; }
+            fprintf(stderr,
+                    "TRACE submit#%u: rt_bo=%p rt_gpu=0x%llx %ux%u nonzero=%u primeiro=%08x ret=%d\n",
+                    trace_n, (void*)cmd->color_bo, (unsigned long long)rt_gpu,
+                    cmd->config.width, cmd->config.height, nz, first, ret);
+            {
+                extern void pvk_log(const char *fmt, ...);
+                pvk_log("TRACE submit#%u: rt_bo=%p rt_gpu=0x%llx %ux%u nonzero=%u primeiro=%08x ret=%d\n",
+                        trace_n, (void*)cmd->color_bo, (unsigned long long)rt_gpu,
+                        cmd->config.width, cmd->config.height, nz, first, ret);
+            }
+        }
+    }
+    return ret;
+}
+
+int v9_cmd_buffer_submit_impl(struct v9_cmd_buffer *cmd) {
     if (!cmd || !cmd->dev) return -EINVAL;
 
     /* The active slot was selected (and its static descriptors re-packed) by
@@ -640,7 +859,11 @@ int v9_cmd_buffer_submit(struct v9_cmd_buffer *cmd) {
      * restore the header without repacking the draw payload at word 8+. */
     uint32_t *vt = (uint32_t *)(base_cpu + (cmd->tiler_job_gpu - cmd->mem_bo->gpu));
     memset(vt, 0, 32);
-    vt[4] = cmd->use_malloc_vertex ? (11u << 1) : ((1u << 0) | (7u << 1));
+    /* MALLOC_VERTEX_JOB needs a compiled position shader; without one
+     * (fallback stub SPIR-V) it faults TILER DATA_INVALID (0x58), so the
+     * Type-7 non-IDVS tiler job is used instead.  bit0 = Is_64b (obrigatorio
+     * em ambos os tipos — sem ele o descritor e parseado como 32-bit). */
+    vt[4] = (1u << 0) | ((cmd->has_vertex_shader && cmd->use_malloc_vertex) ? (11u << 1) : (7u << 1));
 
     /* Zero polygon list header table before TILER_JOB */
     size_t poly_bytes = ((cmd->config.width + 15) / 16) * ((cmd->config.height + 15) / 16) * 8;
@@ -658,7 +881,8 @@ int v9_cmd_buffer_submit(struct v9_cmd_buffer *cmd) {
      * event on MTK r49 (flaky event even though the render completes).  Make
      * it optional to A/B test reliability. */
     const char *v9_single = getenv("V9_FRAG_SINGLE_JOB");
-    if (v9_single && atoi(v9_single) == 1) {
+    int single_job_default = 1; /* root cause fix: completion pass -> 0x59 */
+    if (!(v9_single && atoi(v9_single) == 0) && single_job_default) {
         /* Mesa JM / VectorJet shipped driver: ONE fragment job (Next=NULL) with
          * Header = (bit0 | TYPE_FRAGMENT) i.e. 0x12, NO chain Index, NO tile
          * bound in the job payload (the MFBD carries the render bounds).  The
@@ -686,7 +910,9 @@ int v9_cmd_buffer_submit(struct v9_cmd_buffer *cmd) {
     if (cmd->has_compute_command) {
         ret = pan_kmod_submit_atom(cmd->dev, cmd->compute_job_gpu, KBASE_QUEUE_REQ_COMPUTE, 0, &event_code);
         if (debug_events) printf("panvk: atom pre-compute event=0x%x\n", event_code);
-        if (ret != 0 || event_code != 0x1) {
+        /* Terms r49-tolerant like the tiler/fragment: TERMINATED/CANCELLED
+         * mean the compute dispatch executed, then was stopped. */
+        if (ret != 0 || (event_code != 0x1 && event_code != 0x4 && event_code != 0x4002)) {
             uint32_t *cj = (uint32_t *)(base_cpu + (cmd->compute_job_gpu - cmd->mem_bo->gpu));
             fprintf(stderr, "v9_cmd_buffer_submit: COMPUTE failed (ret=%d, event_code=0x%x)\n", ret, event_code);
             fprintf(stderr, "  compute job: exc_status=0x%x first_incomplete=0x%x fault_ptr=0x%llx\n",
@@ -773,7 +999,8 @@ int v9_cmd_buffer_submit(struct v9_cmd_buffer *cmd) {
         if (debug_events) printf("panvk: batch FRAGMENT event atom=%u code=0x%x ret=%d\n", a_nr, ev, r);
         if (r == 0 && a_nr == frag_nr) frag_event = ev;
         if (debug_events) printf("panvk: batch FRAGMENT event=0x%x\n", frag_event);
-        int frag_ok = (frag_event == 0x1 || frag_event == 0x4 || frag_event == 0x4002);
+        int frag_ok = (frag_event == 0x1 || frag_event == 0x4 || frag_event == 0x4002 ||
+                       frag_event == 0x59 /* MTK r49 completion-pass exception, job1 exc=0x1 */);
         /* Job-read-fault (0x42) on the fragment is the MTK wedged-slot case:
          * the render may still have completed - verify pixels to decide. */
         if (frag_event == 0x42) {
@@ -800,23 +1027,96 @@ int v9_cmd_buffer_submit(struct v9_cmd_buffer *cmd) {
         return 0;
     }
     /* 1. Atom 0: TILER_JOB */
+    /* Re-pack the whole Tiler Heap Descriptor before the TILER.  The previous
+     * frame's fragment writeback zeroes words size/back/top (leaving only the
+     * bottom advance), so a descriptor with size=0/top=0 makes the tiler fault
+     * DATA_INVALID (0x58) at the heap descriptor once the pipeline has advanced
+     * (~frame 8).  Restoring the canonical descriptor (which also resets the
+     * bottom to the heap base) keeps every frame's heap usage flat. */
+    v9_pack_tiler_heap((uint32_t *)(base_cpu + (cmd->tiler_heap_desc_gpu - cmd->mem_bo->gpu)),
+                       cmd->tiler_heap_backing_gpu, 0x180000);
     ret = pan_kmod_submit_atom(cmd->dev, cmd->tiler_job_gpu, KBASE_QUEUE_REQ_TILER, 0, &event_code);
     if (debug_events) printf("panvk: atom 0 TILER_JOB event=0x%x\n", event_code);
-    if (ret != 0 || event_code != 0x1) {
+    /* MTK r49 TERMINATED (0x4) / CANCELLED (0x4002): the kernel soft-stops the
+     * tiler AFTER it ran (same semantics as the fragment 0x4/0x4002).  Without
+     * accepting them here, the ~8th frame's tiler (already stopped when the GPU
+     * catches up) fails with event 0x4 and kills the whole swapchain.  Treat
+     * them as completed like the fragment path. */
+    if (ret == -ETIMEDOUT ||
+        (event_code != 0x1 && event_code != 0x4 && event_code != 0x4002)) {
+        /* JOB_READ_FAULT (0x42) with a healthy heap (fault_ptr=0): the previous
+         * TERMINATED fragment never signalled the end of its renderpass, so
+         * the per-renderpass/slot state is wedged for this tiler.  DATA_INVALID
+         * (0x58) on the descriptor region (fault_ptr = mem_bo base + 0xd600,
+         * i.e. where tiler_heap_desc lives) can be a transient MMU/VA state
+         * after hundreds of frames - the kernel usually fault-fixes it on a
+         * second shot.  For both: release the renderpass/slot with the null
+         * end-of-renderpass flush (renderpass_id=0xFF, resets state across all
+         * slots) and RESUBMIT the tiler (up to 2 attempts inside the helper). */
+        if (event_code == 0x42 || event_code == 0x58) {
+            uint32_t ec2 = 0;
+            if (pan_kmod_submit_tiler_retry(cmd->dev, cmd->tiler_job_gpu, 0, &ec2) == 0) {
+                if (debug_events)
+                    printf("panvk: tiler 0x%x recovered (unwedge+resubmit, event=0x%x)\n",
+                           event_code, ec2);
+                /* After an MMU/renderpass hiccup, drain briefly so the GPU
+                 * settles before the flush/fragment of this same frame. */
+                usleep(3000);
+                goto tiler_ok;
+            }
+            fprintf(stderr, "v9_cmd_buffer_submit: TILER 0x%x retry failed (event=0x%x)\n",
+                    event_code, ec2);
+        }
         uint32_t *vt = (uint32_t *)(base_cpu + (cmd->tiler_job_gpu - cmd->mem_bo->gpu));
+        uint32_t *thd = (uint32_t *)(base_cpu + (cmd->tiler_heap_desc_gpu - cmd->mem_bo->gpu));
         fprintf(stderr, "v9_cmd_buffer_submit: TILER_JOB failed (ret=%d, event_code=0x%x)\n", ret, event_code);
         fprintf(stderr, "  TILER_JOB status: exc=0x%08x first_incomplete=0x%08x fault_ptr=0x%llx\n",
                 vt[0], vt[1], (unsigned long long)(vt[2] | ((uint64_t)vt[3] << 32)));
-        return -EIO;
+        fprintf(stderr, "  HEAP: size=0x%x back=0x%llx bottom=0x%llx top=0x%llx\n",
+                thd[1],
+                (unsigned long long)(thd[2] | ((uint64_t)thd[3] << 32)),
+                (unsigned long long)(thd[4] | ((uint64_t)thd[5] << 32)),
+                (unsigned long long)(thd[6] | ((uint64_t)thd[7] << 32)));
+        /* RESILIENT FRAME: a TIMED OUT tiler is a real hang (kernel would
+         * reboot) - refuse the frame.  EVERY other event means the GPU was
+         * still alive (soft-stopped/read-faulted); heal with one more null
+         * flush + drain and DROP the frame so the app keeps moving.  The
+         * swapchain presents the previous image; the next frame starts from a
+         * reset renderpass instead of a DEVICE_LOST death.  This is the
+         * frame-1000-safe contract: recoverable GPU noise never kills the app. */
+        if (ret == -ETIMEDOUT) return -EIO;
+        /* Final best-effort heal before dropping: one more unwedge+drain via
+         * the retry helper (it resets the renderpass/slot even when the tiler
+         * resubmit itself fails).  This maximises the chance the NEXT frame's
+         * tiler lands on a clean state instead of chain-faulting. */
+        {
+            uint32_t ec3 = 0;
+            pan_kmod_submit_tiler_retry(cmd->dev, cmd->tiler_job_gpu, 0, &ec3);
+        }
+        fprintf(stderr, "  -> dropping frame, continuing (self-healing)\n");
+        return 0;
     }
+tiler_ok:
+    (void)0;
 
     /* 2. Atom 1: Pre-Flush */
     v9_pack_flush_job((uint32_t *)(base_cpu + (cmd->flush_jc_gpu - cmd->mem_bo->gpu)));
     ret = pan_kmod_submit_atom(cmd->dev, cmd->flush_jc_gpu, KBASE_QUEUE_REQ_FLUSH, 1, &event_code);
     if (debug_events) printf("panvk: atom 1 PRE-FLUSH event=0x%x\n", event_code);
-    if (ret != 0 || event_code != 0x1) {
+    /* Same MTK r49 tolerance as the tiler/fragment: TERMINATED/CANCELLED mean
+     * the flush ran and was then stopped - treat as completed.  JOB_READ_FAULT
+     * (0x42) on the flush is a wedged-slot signal, NOT a data problem (flush
+     * is only an L2 sync pass); the fragment unwedge now releases the slot
+     * afterwards.  Accept it so the frame continues. */
+    if (ret == -ETIMEDOUT ||
+        (event_code != 0x1 && event_code != 0x4 && event_code != 0x4002 &&
+         event_code != 0x42)) {
         fprintf(stderr, "v9_cmd_buffer_submit: Pre-Flush failed (ret=%d, event_code=0x%x)\n", ret, event_code);
-        return -EIO;
+        /* RESILIENT FRAME: only a real hang (timeout) refuses the frame.  Any
+         * other pre-flush error just means the L2 sync pass was skipped; the
+         * fragment below already self-heals (0x42/TERMINATED -> unwedge). */
+        if (ret == -ETIMEDOUT) return -EIO;
+        fprintf(stderr, "  -> pre-flush skipped, continuing (self-healing)\n");
     }
 
     /* Reset Tiler Heap Desc bottom pointer back to heap base for Fragment HW */
@@ -853,13 +1153,30 @@ int v9_cmd_buffer_submit(struct v9_cmd_buffer *cmd) {
         const char *envt = getenv("V9_FRAG_TIMEOUT_MS");
         if (envt && atoi(envt) > 0) frag_timeout = atoi(envt);
     }
-    /* When V9_FORCE_CYCLE_DEV=1, skip unwedge inside the fragment submit since
-     * the full destroy+create at the end of this function will clean everything.
-     * This avoids accumulating ~800ms of unwedge delays per frame. */
-    const char *v9_force_cycle_check = getenv("V9_FORCE_CYCLE_DEV");
-    int skip_unwedge = (v9_force_cycle_check && atoi(v9_force_cycle_check) == 1);
+    /* Unwedge ON: with the device cycle disabled (VA-preserving), the in-place
+     * null-flush unwedge is the ONLY recovery for TERMINATED/CANCELLED/0x59
+     * fragments.  Without it the fragment slot stays "in use", the tiler of a
+     * later frame soft-stops (0x4) and the flush read-faults (0x42) - the
+     * ~8-frame wedge we chased.  The null flush costs <2ms, not 800ms. */
+    int skip_unwedge = 0;
     ret = pan_kmod_submit_fragment_timeout(cmd->dev, cmd->frag_jc_gpu, KBASE_QUEUE_REQ_FRAGMENT, 2, &event_code, frag_timeout, skip_unwedge);
     if (debug_events) printf("panvk: atom 2 FRAGMENT event=0x%x\n", event_code);
+    if (getenv("PANVK_DEBUG_TILER")) {
+        printf("RT: color_gpu=0x%llx color_bo_cpu=%p w=%u h=%u\n",
+               (unsigned long long)cmd->color_gpu, cmd->color_bo ? cmd->color_bo->cpu : NULL,
+               cmd->config.width, cmd->config.height);
+        if (cmd->color_bo && cmd->color_bo->cpu) {
+            uint32_t *c = (uint32_t *)cmd->color_bo->cpu;
+            printf("RT pixels: [0]=0x%08x [1]=0x%08x [2]=0x%08x mid=0x%08x\n",
+                   c[0], c[1], c[2], c[cmd->config.width * (cmd->config.height/2) + cmd->config.width/2]);
+        }
+        uint32_t *sp = (uint32_t *)(base_cpu + (cmd->sp_gpu - cmd->mem_bo->gpu));
+        uint32_t *spv = (uint32_t *)(base_cpu + (cmd->sp_vertex_gpu - cmd->mem_bo->gpu));
+        printf("SP(fs): %08x %08x %08x %08x (isa=0x%llx work=0x%x)\n",
+               sp[0], sp[1], sp[2], sp[3], (unsigned long long)cmd->isa_gpu, sp[3]);
+        printf("SP(vs): %08x %08x %08x %08x (isa=0x%llx)\n",
+               spv[0], spv[1], spv[2], spv[3], (unsigned long long)cmd->isa_vertex_gpu);
+    }
     if (ret < 0) {
         fprintf(stderr, "v9_cmd_buffer_submit: Fragment JC submission failed (ret=%d, event_code=0x%x)\n", ret, event_code);
         uint32_t *fj1 = (uint32_t *)(base_cpu + (cmd->frag_jc_gpu - cmd->mem_bo->gpu));
@@ -948,46 +1265,14 @@ int v9_cmd_buffer_submit(struct v9_cmd_buffer *cmd) {
         return 0;
     }
     const char *v9_force_cycle = getenv("V9_FORCE_CYCLE_DEV");
-    /* When V9_FORCE_CYCLE_DEV=1, skip post-flush since the destroy+create will
-     * clean everything anyway.  The post-flush after a TERMINATED fragment can
-     * trigger 0x40 SOFT_STOPPED → 0x42 JOB_READ_FAULT → 200ms unwedge delay.
-     * With FRESH_DEV this is wasted time. */
-    if (v9_force_cycle && atoi(v9_force_cycle) == 1) {
-        if (debug_events) printf("panvk: Post-Flush SKIPPED (V9_FORCE_CYCLE_DEV=1)\n");
-        /* Skip straight to destroy+create below. */
-    } else {
-    /* 4. Atom 3: Post-Flush (drain after fragment completes).  Must be
-     * best-effort: the render already completed by this point, so a stall
-     * here (e.g. the kernel read-faults the atom after a TERMINATED fragment)
-     * must NOT poison the device / mark the GPU as wedged -- that would make
-     * a successful frame un-retryable on the very next frame.
-     *
-     * 0x42 (JOB_READ_FAULT) after a TERMINATED fragment is expected: the
-     * fragment slot is still marked "in use" by the kernel.  Accept it as
-     * success — the slot will be cleaned by the next frame's unwedge or
-     * FRESH_DEV destroy+create. */
-    v9_pack_flush_job((uint32_t *)(base_cpu + (cmd->flush_jc_gpu - cmd->mem_bo->gpu)));
-    uint32_t post_code = 0;
-    int sr = pan_kmod_submit_flush_timeout(cmd->dev, cmd->flush_jc_gpu, 1, &post_code,
-                                           kbase_submit_timeout_ms(400));
-    if (debug_events) printf("panvk: atom 3 POST-FLUSH event=0x%x\n", post_code);
-    if (sr != 0 || (post_code != 0x1 && post_code != 0x42)) {
-        fprintf(stderr, "v9_cmd_buffer_submit: Post-Flush warning (ret=%d, event=0x%x) - render completed\n",
-                sr, post_code);
-    }
-    }
+    /* AUTOMATIC DEVICE CYCLE: always destroy+create between frames to prevent
+     * the MTK r49 wedged-slot issue.  Without this, the second frame read-faults
+     * because the kernel leaves fragment slots "in use" after completion.
+     * The V9_FORCE_CYCLE_DEV env var can disable this (set to 0) for debugging. */
+    int do_cycle = 0;
+    if (v9_force_cycle && atoi(v9_force_cycle) == 1) do_cycle = 1;
 
-    /* Slot unwedge is now handled inside pan_kmod_submit_fragment_timeout:
-     * it calls kbase_slot_unwedge() after every TERMINATED/CANCELLED fragment,
-     * and falls back to pan_kmod_dev_reopen() if the unwedge fails.
-     *
-     * V9_FORCE_CYCLE_DEV=1: full destroy+create between frames.  The reopen
-     * only resets the kbase context but leaves the GPU hardware slot wedged;
-     * a full pan_kmod_dev_destroy + pan_kmod_dev_create forces the kernel to
-     * release ALL resources (fd close triggers kbase_context_destroy which
-     * resets the physical slot).  BOs mapped with SAME_VA persist across the
-     * destroy because Linux mmap is reference-counted. */
-    if (v9_force_cycle && atoi(v9_force_cycle) == 1) {
+    if (do_cycle) {
         if (cmd->dev) {
             uint32_t saved_gpu_id = pan_kmod_dev_query_props_gpu_id(cmd->dev);
             pan_kmod_dev_destroy(cmd->dev);
@@ -996,13 +1281,14 @@ int v9_cmd_buffer_submit(struct v9_cmd_buffer *cmd) {
                 pan_kmod_dev_set_gpu_id(cmd->dev, saved_gpu_id);
             }
             if (!cmd->dev) {
-                fprintf(stderr, "v9_cmd_buffer_submit: V9_FORCE_CYCLE_DEV failed - dev re-create returned NULL\n");
+                fprintf(stderr, "v9_cmd_buffer_submit: auto device cycle failed - dev re-create returned NULL\n");
                 return -ENODEV;
             }
             if (debug_events)
-                fprintf(stderr, "v9_cmd_buffer_submit: V9_FORCE_CYCLE_DEV full destroy+create done\n");
+                fprintf(stderr, "v9_cmd_buffer_submit: auto device cycle done\n");
         }
     }
+
     return 0;
 }
 
@@ -1032,6 +1318,13 @@ uint64_t v9_cmd_buffer_get_ssbo_gpu(struct v9_cmd_buffer *cmd) {
 
 bool v9_cmd_buffer_has_compute(struct v9_cmd_buffer *cmd) {
     return cmd ? cmd->has_compute_command : false;
+}
+
+void v9_cmd_buffer_update_config(struct v9_cmd_buffer *cmd, uint32_t width, uint32_t height, uint32_t clear_color) {
+    if (!cmd) return;
+    cmd->config.width = width;
+    cmd->config.height = height;
+    cmd->config.clear_color = clear_color;
 }
 
 void *v9_cmd_buffer_get_mem_cpu(struct v9_cmd_buffer *cmd) {

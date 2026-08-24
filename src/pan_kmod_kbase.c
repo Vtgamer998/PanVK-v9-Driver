@@ -59,6 +59,9 @@ struct pan_kmod_dev {
      * causes infinite rapid reopen() calls that exhaust kernel kbase context
      * resources → kernel OOM → reboot. */
     int consecutive_failures;
+    /* Rotating atom number for internal recovery jobs (tiler unwedge+resubmit).
+     * Must differ from the real atom the kernel assigns to the retried job. */
+    uint8_t rot_atom;
 };
 
 struct pan_kmod_dev *pan_kmod_dev_create(const char *dev_node) {
@@ -279,7 +282,48 @@ int pan_kmod_submit_atom_timeout(struct pan_kmod_dev *dev, uint64_t jc_gpu, uint
         return -ETIMEDOUT; /* Never treat a hung GPU as success */
     }
     pthread_mutex_unlock(&dev->dev_lock);
-    return (ret == 0 && rx_code == 0x1) ? 0 : -EIO;
+    /* MTK r49 soft-stops jobs AFTER they run: TERMINATED (0x4) / CANCELLED
+     * (0x4002) mean the atom executed, matching the fragment success set. */
+    return (ret == 0 && (rx_code == 0x1 || rx_code == 0x4 || rx_code == 0x4002)) ? 0 : -EIO;
+}
+
+int pan_kmod_submit_tiler_retry(struct pan_kmod_dev *dev, uint64_t jc_gpu,
+                                uint32_t atom_id, uint32_t *event_code) {
+    if (!dev || !dev->kdev) return -EINVAL;
+    pthread_mutex_lock(&dev->dev_lock);
+
+    /* First release the wedged renderpass/slot via the null end-of-renderpass
+     * flush (renderpass_id=0xFF).  On MTK r49 that marker resets the
+     * per-renderpass state across ALL job slots - which is exactly what a
+     * tiler JOB_READ_FAULT (0x42) right after a TERMINATED fragment leaves
+     * behind (the last fragment never signalled the end of its renderpass). */
+    /* Systemic recovery: up to 2 attempts, each drains the soft-stop (2ms)
+     * so any frame anywhere (1000, 1001, ...) self-heals on its own instead
+     * of requiring a driver build per error. */
+    int attempt, ok = -EIO;
+    for (attempt = 0; attempt < 2 && ok != 0; attempt++) {
+        uint8_t uw_atom = ++dev->rot_atom;
+        if (uw_atom == 0) uw_atom = ++dev->rot_atom;
+        if (kbase_slot_unwedge(dev->kdev, uw_atom, 200) != 0) {
+            fprintf(stderr, "pan_kmod: tiler retry - unwedge failed\n");
+        }
+        usleep(2000); /* let the soft-stop drain before slot 1 is re-fired */
+
+        /* Resubmit the tiler job with a fresh atom the kernel assigns. */
+        uint32_t rx_atom = 0, rx_code = 0;
+        uint8_t assigned_atom = 0;
+        int ret = kbase_submit_job(dev->kdev, jc_gpu, KBASE_QUEUE_REQ_TILER, atom_id, 0, 0, &assigned_atom);
+        if (ret >= 0) {
+            ret = kbase_wait_event_timeout(dev->kdev, &rx_atom, &rx_code, 400, assigned_atom);
+        } else {
+            ret = -EIO;
+        }
+        if (ret == 0 && (rx_code == 0x1 || rx_code == 0x4 || rx_code == 0x4002))
+            ok = 0;
+        if (event_code) *event_code = rx_code;
+    }
+    pthread_mutex_unlock(&dev->dev_lock);
+    return ok;
 }
 
 int pan_kmod_submit_flush_timeout(struct pan_kmod_dev *dev, uint64_t jc_gpu,
@@ -385,17 +429,33 @@ int pan_kmod_submit_fragment_timeout(struct pan_kmod_dev *dev, uint64_t jc_gpu, 
             if (uw_atom == assigned_atom)
                 uw_atom = (uint8_t)((uw_atom % 254) + 1);
             if (kbase_slot_unwedge(dev->kdev, uw_atom, 200) != 0) {
-                fprintf(stderr, "pan_kmod: fragment 0x42 JOB_READ_FAULT - auto-reopening kbase context\n");
-                pan_kmod_dev_reopen(dev);
+                fprintf(stderr, "pan_kmod: fragment 0x42 - unwedge failed, NOT reopening "
+                                "(dev_reopen destroys kbase VA reservations -> DATA_INVALID)\n");
+            } else {
+                /* Drain: after a soft-stopped fragment the GPU's L2/MMU ops are
+                 * still settling.  If we fire the next slot's job immediately
+                 * the kernel soft-stops again, cascading a wedge a frame or two
+                 * later (the 0x42 tiler).  2ms is enough for the soft-stop
+                 * drain on r49; keeps recovery self-contained so ANY frame
+                 * (1000, 1001, ...) heals on its own without driver builds. */
+                usleep(2000);
             }
         }
         pthread_mutex_unlock(&dev->dev_lock);
         return 0;
     }
 
-    int success = (ret == 0 && (rx_code == 0x1 || rx_code == 0x4 || rx_code == 0x4002));
+    /* 0x59: MTK r49 completion-pass exception - FJ1 polygon-list job reports
+     * exc=0x1 and the frame rasterises, but the event delivered for the whole
+     * fragment atom is 0x59 instead of a clean DONE.  Treat as render-complete. */
+    if (rx_code == 0x59) {
+        fprintf(stderr, "pan_kmod: fragment event=0x59 (completion exception, "
+                        "job1 exc=0x1) - treating as rendered\n");
+    }
+    int success = (ret == 0 && (rx_code == 0x1 || rx_code == 0x4 ||
+                                rx_code == 0x4002 || rx_code == 0x59));
 
-    if (success && (rx_code == 0x4 || rx_code == 0x4002)) {
+    if (success && (rx_code == 0x4 || rx_code == 0x4002 || rx_code == 0x59)) {
         /* TERMINATED / CANCELLED: fragment rendered but the MTK r49 kernel
          * leaves the fragment slot internally marked "in use".  Without an
          * unwedge, the next fragment submit would hit JOB_READ_FAULT (0x42)
@@ -410,8 +470,13 @@ int pan_kmod_submit_fragment_timeout(struct pan_kmod_dev *dev, uint64_t jc_gpu, 
          * atom must differ from the REAL fragment atom number (assigned_atom),
          * not the caller's ignored atom_id hint.
          * When skip_unwedge=1 (FRESH_DEV mode), skip unwedge since the caller
-         * will destroy+create a fresh device anyway. */
-        if (!skip_unwedge) {
+         * will destroy+create a fresh device anyway.  EXCEPTION: 0x59 also
+         * runs the unwedge even under FRESH_DEV, because the completed-exception
+         * leaves the per-renderpass state (tiler+fragment) wedged and the device
+         * cycle alone lets the NEXT tiler job fault DEVICE_TERMINATED/NONFAULT
+         * DATA_INVALID (0x58).  The end-of-renderpass marker (renderpass_id=0xFF)
+         * resets that state across all job slots. */
+        if (!skip_unwedge || rx_code == 0x59) {
             uint8_t unwedge_atom = (uint8_t)((assigned_atom % 254) + 1);
             if (unwedge_atom == assigned_atom)
                 unwedge_atom = (uint8_t)((unwedge_atom % 254) + 1);
@@ -419,16 +484,14 @@ int pan_kmod_submit_fragment_timeout(struct pan_kmod_dev *dev, uint64_t jc_gpu, 
             int uw = kbase_slot_unwedge(dev->kdev, unwedge_atom, 200);
             if (uw != 0) {
                 fprintf(stderr,
-                    "pan_kmod: slot unwedge failed (%d), falling back to dev_reopen\n", uw);
-                pan_kmod_dev_reopen(dev);
-                /* After dev_reopen the GPU hardware slot may still be wedged
-                 * (the MTK r49 GPU shares slots across kbase contexts).  Do NOT
-                 * poison here — the render may have actually completed
-                 * (TERMINATED means the kernel stopped the job AFTER execution).
-                 * The caller (v9_cmd_buffer_submit) verifies pixels and only
-                 * sets the permanent wedge marker when the render truly failed
-                 * (rendered=false).  Poisoning here would block all subsequent
-                 * submits even when the frame rendered successfully. */
+                    "pan_kmod: slot unwedge failed (%d) - NOT reopening (dev_reopen "
+                    "destroys the kbase VA reservations so every later submit would "
+                    "MMU-fault DATA_INVALID). The frame completes and the slot stays "
+                    "soft-stopped; a future 0x1 fragment resyncs the pipeline.\n", uw);
+            } else {
+                /* Drain the soft-stop before the caller submits the next
+                 * frame's tiler (see the 0x42 path above). */
+                usleep(2000);
             }
         }
     }

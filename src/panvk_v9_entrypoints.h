@@ -238,6 +238,14 @@ VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceCalibrateableTimeDomainsEXT(Vk
 VKAPI_ATTR VkResult VKAPI_CALL vkGetCalibratedTimestampsEXT(VkDevice device, uint32_t timestampCount, const VkCalibratedTimestampInfoEXT *pTimestampInfos, uint64_t *pTimestamps, uint64_t *pMaxDeviation);
 VKAPI_ATTR void VKAPI_CALL vkCmdSetStencilOpEXT(VkCommandBuffer commandBuffer, VkStencilFaceFlags faceMask, VkStencilOp failOp, VkStencilOp passOp, VkStencilOp depthFailOp, VkCompareOp compareOp);
 
+/* VK_KHR_external_memory_win32 / external_semaphore_win32 stubs
+ * (Box64 has GO() wrappers for these; returning non-NULL prevents the
+ * "Ask to run at NULL" crash in winevulkan). */
+VKAPI_ATTR VkResult VKAPI_CALL vkGetMemoryWin32HandleKHR(VkDevice device, const void *pGetWin32HandleInfo, void **pHandle);
+VKAPI_ATTR VkResult VKAPI_CALL vkGetMemoryWin32HandlePropertiesKHR(VkDevice device, uint32_t handleType, void *handle, void *pMemoryWin32HandleProperties);
+VKAPI_ATTR VkResult VKAPI_CALL vkGetSemaphoreWin32HandleKHR(VkDevice device, const void *pGetWin32HandleInfo, void **pHandle);
+VKAPI_ATTR VkResult VKAPI_CALL vkImportSemaphoreWin32HandleKHR(VkDevice device, const void *pImportSemaphoreWin32HandleInfo);
+
 /* Dynamically linked feature/limit query helpers used by DXVK bring-up */
 void panvk_v9_fill_features(VkPhysicalDeviceFeatures *features);
 void panvk_v9_fill_features2(VkPhysicalDeviceFeatures2 *features2);

@@ -125,8 +125,14 @@ int kbase_slot_unwedge(struct kbase_dev *dev, uint8_t atom_nr, int timeout_ms) {
         return ret;
     }
 
-    /* 0x1 DONE = clean.  0x4 TERMINATED = also acceptable on some kernels. */
-    if (rx_code == 0x1 || rx_code == 0x4) {
+    /* 0x1 DONE = clean.  0x4 TERMINATED = also acceptable on some kernels.
+     * 0x40 SOFT_STOPPED = the flush's whole purpose is to trigger
+     * kbase_job_slot_softstop() on the slot; the kernel reporting the flush
+     * was soft-stopped means that soft-stop WAS carried out, i.e. the slot's
+     * "in use" mark got released.  Treating 0x40 as OK prevents the caller's
+     * dev_reopen fallback, which would invalidate the kbase VA reservations
+     * and make every subsequent submit MMU-fault DATA_INVALID. */
+    if (rx_code == 0x1 || rx_code == 0x4 || rx_code == 0x40) {
         fprintf(stderr,
             "kbase_slot_unwedge: OK — fragment slot released "
             "(null flush code=0x%x atom=%u)\n",

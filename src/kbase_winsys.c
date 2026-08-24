@@ -9,6 +9,7 @@
 #include <sys/mman.h>
 #include <sys/poll.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <time.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -231,6 +232,13 @@ struct kbase_dev *kbase_dev_open(const char *dev_node) {
         return NULL;
     }
 
+    {
+        struct stat sb;
+        if (fstat(fd, &sb) == 0)
+            printf("kbase_winsys: /dev/mali0 node rdev=%u:%u\n",
+                   major(sb.st_rdev), minor(sb.st_rdev));
+    }
+
     struct kbase_ioctl_version_check vc = { KBASE_API_MAJOR, KBASE_API_MINOR };
     if (ioctl(fd, KBASE_IOCTL_VERSION_CHECK, &vc) < 0) {
         perror("kbase_dev_open: KBASE_IOCTL_VERSION_CHECK");
@@ -427,11 +435,47 @@ struct kbase_bo *kbase_bo_alloc(struct kbase_dev *dev, size_t size, uint32_t fla
      * Passing the VA as the mmap offset lets kbase locate the region. */
     void *cpu_ptr = mmap(NULL, aligned_size, prot, MAP_SHARED, dev->fd, gpu_va);
     if (cpu_ptr == MAP_FAILED) {
-        /* Free the kernel GPU allocation that was just made to avoid leaking it. */
-        struct kbase_ioctl_mem_free free_arg = { .handle = gpu_va };
-        ioctl(dev->fd, KBASE_IOCTL_MEM_FREE, &free_arg);
-        perror("kbase_bo_alloc: mmap");
-        return NULL;
+        int e1 = errno;
+        fprintf(stderr, "kbase_bo_alloc: mmap#1 off=%llx size=%zu -> %s\n",
+                (unsigned long long)gpu_va, aligned_size, strerror(e1));
+
+        cpu_ptr = mmap((void *)(uintptr_t)gpu_va, aligned_size, prot,
+                       MAP_SHARED | MAP_FIXED, dev->fd, 0);
+        if (cpu_ptr == MAP_FAILED) {
+            int e2 = errno;
+            fprintf(stderr, "kbase_bo_alloc: mmap#2 fixed off=0 size=%zu -> %s\n",
+                    aligned_size, strerror(e2));
+
+            cpu_ptr = mmap((void *)(uintptr_t)gpu_va, aligned_size, prot,
+                           MAP_SHARED | MAP_FIXED, dev->fd, gpu_va);
+            if (cpu_ptr == MAP_FAILED) {
+                int e3 = errno;
+                fprintf(stderr, "kbase_bo_alloc: mmap#3 fixed off=%llx size=%zu -> %s\n",
+                        (unsigned long long)gpu_va, aligned_size, strerror(e3));
+
+                cpu_ptr = mmap(NULL, aligned_size, prot,
+                               MAP_SHARED | MAP_FIXED_NOREPLACE, dev->fd, gpu_va);
+                if (cpu_ptr == MAP_FAILED) {
+                    int e4 = errno;
+                    fprintf(stderr, "kbase_bo_alloc: mmap#4 noreplace off=%llx size=%zu -> %s\n",
+                            (unsigned long long)gpu_va, aligned_size, strerror(e4));
+                    fprintf(stderr,
+                            "kbase_bo_alloc: ALL mmap variants failed (errno %d/%d/%d/%d) "
+                            "gpu_va=%llx size=%zu\n",
+                            e1, e2, e3, e4,
+                            (unsigned long long)gpu_va, aligned_size);
+                    struct stat sb;
+                    if (fstat(dev->fd, &sb) == 0)
+                        fprintf(stderr, "kbase_bo_alloc: dev->fd rdev=%u:%u\n",
+                                major(sb.st_rdev), minor(sb.st_rdev));
+
+                    /* Free the kernel GPU allocation that was just made. */
+                    struct kbase_ioctl_mem_free free_arg = { .handle = gpu_va };
+                    ioctl(dev->fd, KBASE_IOCTL_MEM_FREE, &free_arg);
+                    return NULL;
+                }
+            }
+        }
     }
 
     struct kbase_bo *bo = calloc(1, sizeof(*bo));

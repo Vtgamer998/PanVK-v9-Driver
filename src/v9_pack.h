@@ -126,12 +126,17 @@ static inline void v9_pack_mfbd(uint32_t *mfbd, uint32_t width, uint32_t height,
     pack_u64(mfbd + 4, sampleloc_gpu);
     pack_u64(mfbd + 6, dcd_gpu);
     uint32_t *params = mfbd + 8;
-    uint32_t tiles_x = (width  + 15) / 16;
-    uint32_t tiles_y = (height + 15) / 16;
+    /* Framebuffer Parameters (v9 genxml): word8 Width/Height minus(1),
+     * word9 Bound Min X/Y, word10 Bound Max X/Y in PIXELS (frame_bounding_box),
+     * word11: Sample Count log2, Tie-Break, Effective Tile Size log2,
+     * Render Target Count minus(1), Color Buffer Allocation shr(10).
+     * Mesa pan_emit_fbd: bound_min=0,0 ; bound_max=(w-1),(h-1) ;
+     * effective_tile_size=log2(16)=4 ; render_target_count=0 (1 RT) ;
+     * color_buffer_allocation=1024>>10=1 for a 16x16 RGBA8 tile buffer. */
     params[0] = (width - 1)  | ((height - 1) << 16);
-    params[1] = (tiles_x - 1) | ((tiles_y - 1) << 16);
-    params[2] = (width - 1)  | ((height - 1) << 16);
-    params[3] = (2 << 6) | (1 << 19) | (1 << 24);
+    params[1] = 0;                                   /* Bound Min 0,0 px */
+    params[2] = (width - 1)  | ((height - 1) << 16); /* Bound Max px */
+    params[3] = (2 << 6) | (4 << 9) | (0 << 19) | (1 << 24);
     params[4] = (1 << 16);
     pack_u64(params + 6, tiler_ctx_gpu);
 }
@@ -159,73 +164,119 @@ static inline void v9_pack_tiler_job(uint32_t *vt, uint32_t width, uint32_t heig
                                       uint32_t vertex_count, bool malloc_vertex,
                                       uint32_t fau_fs_count, uint64_t fau_fs_gpu,
                                       uint32_t fau_vs_count, uint64_t fau_vs_gpu) {
+    /* MALLOC_VERTEX_JOB (Job Type 11) needs a compiled position shader to feed
+     * the integrated tiler: when sp_vertex_gpu==0 (no vertex shader compiled,
+     * e.g. the fallback stub SPIR-V path) the position shader env is absent and
+     * the MALLOC job faults with TILER DATA_INVALID (0x58).  Fall back to the
+     * non-IDVS "Tiler Job" (Type 7) which draws the raw vertex buffer directly.
+     * Use malloc_vertex only when the caller produced a position shader. */
+    malloc_vertex = malloc_vertex && (sp_vertex_gpu != 0);
     memset(vt, 0, 384);
-    vt[4] = malloc_vertex ? (11u << 1) : ((1u << 0) | (7u << 1));
-    pack_u64(vt + 6, 0);           /* Next = 0 */
+    /* Job Header word 4: bit0 = Is_64b (OBRIGATORIO, default true no genxml
+     * v7 "Job Header"; sem ele o GPU parseia o descritor como 32-bit e falha
+     * com TILER DATA_INVALID 0x58 apontando para o proprio job).  Type=11
+     * (Malloc Vertex/IDVS) ou Type=7 (Tiler non-IDVS). */
+    vt[4] = (1u << 0) | (malloc_vertex ? (11u << 1) : (7u << 1));
+    pack_u64(vt + 6, 0);                          /* Next = 0 */
+
+    /* PRIMITIVE section (offset 32, words 8..11).
+     * Draw mode 8 = Triangles.  Allow_rotating_primitives (bit15),
+     * Low/High depth cull (bits16/17) set to clip safely.  Index type
+     * encodes the index element: 0 => none, 2 => uint16, 3 => uint32. */
     if (malloc_vertex) {
-        uint32_t hw_index_type = idx_gpu ? (index_type == 1 ? 3u : 2u) : 0u;
-        vt[8] = 8u | (hw_index_type << 8) | (1u << 15);
-        vt[9] = 0;
+        uint32_t hw_index_type = (idx_gpu && index_type) ? (index_type == 1 ? 3u : 2u) : 0u;
+        vt[8] = 8u | (hw_index_type << 8) | (1u << 15) | (1u << 16) | (1u << 17);
     } else {
         vt[8] = (index_type == 1 ? 0x3C008 : 0x38008);
-        vt[9] = 0;
     }
-    vt[10] = 0;
-    vt[11] = index_count > 0 ? index_count : 3;
-    vt[12] = 1;                    /* Instance count = 1 */
-    vt[13] = malloc_vertex ?
-             (sp_varying_gpu ? (32u | (16u << 16)) : 16u) :
-             (vertex_count > 0 ? vertex_count : 3);
+    vt[9] = 0;                                    /* Base vertex offset */
+    vt[10] = 0;                                   /* Instance offset */
+    vt[11] = index_count > 0 ? index_count : 3;   /* Index count */
+
+    /* INSTANCE_COUNT (offset 48) = pack count word. */
+    vt[12] = 1;                                   /* instance_count = 1 */
+
+    /* ALLOCATION (offset 52): Vertex packet stride 16, attribute stride 0
+     * for "no varyings"; with a secondary varying shader: packet stride
+     * generic_size+16, attribute stride generic_size.  For Type 7 this word
+     * holds the vertex count for the non-indexed (IDVS-less) draw. */
+    if (malloc_vertex) {
+        vt[13] = sp_varying_gpu ? ((0 + 16) | ((0u) << 16))
+                                : (16u | (0u << 16));
+    } else {
+        vt[13] = (vertex_count > 0 ? vertex_count : 3);
+    }
     if (malloc_vertex && sp_varying_gpu)
-        vt[8] |= 1u << 18;         /* Secondary IDVS varying shader */
+        vt[8] |= 1u << 18;                        /* Secondary IDVS varying shader */
+
+    /* TILER section at offset 56 (words 14..15): tiler context descriptor. */
     pack_u64(vt + 14, tiler_ctx_gpu);
+
+    /* Type 7 non-IDVS path needs the extra tiler context words at 17/24. */
     if (!malloc_vertex) {
         vt[17] = 4;
         pack_u64(vt + 24, tiler_ctx_gpu);
     }
-    vt[27] = (width - 1) | ((height - 1) << 16);
+
+    /* SCISSOR at offset 104 (26..27): full framebuffer. */
+    vt[26] = 0;                                   /* Min X | (Min Y<<16) = 0,0 */
+    vt[27] = (width - 1) | ((height - 1) << 16);  /* Max X | (Max Y<<16) */
+
+    /* PRIMITIVE_SIZE at offset 112 (28..29): fixed line width = 0 (no PSIZ). */
     pack_u64(vt + 28, 0x3f800000ULL);
+
+    /* INDICES at offset 120 (30..31): index buffer address (0 if none). */
     pack_u64(vt + 30, idx_gpu);
 
+    /* DRAW section (DCD) at offset 128 (words 32+). */
     uint32_t *dw = vt + 32;
-    dw[0] = (1u << 0) | (1u << 1) | (1u << 6);
-    dw[1] = 0xFFFF | (0x1u << 16);
+    dw[0] = (1u << 0) | (1u << 1) | (1u << 6);    /* allow fwd kill/be killed + reorder */
+    dw[1] = 0xFFFF | (0x1u << 16);                /* Sample mask 0xFFFF, RT mask 1 */
     if (malloc_vertex) {
-        dw[2] = 1u; /* Packet mode: position shader feeds the integrated tiler. */
+        /* Vertex array: Packet mode (bit0=1) - HW fills the pointer/strides
+         * back from the IDVS position buffer.  Pointer bits left zero. */
+        dw[2] = 1u;                               /* Packet = true */
+        dw[3] = 0;
+        dw[4] = 0;
     } else {
+        /* Type 7: direct vertex array = pos_gpu shr 6. */
         uint64_t V = pos_gpu >> 6;
         dw[2] = (uint32_t)((V & 0x03FFFFFFu) << 6);
         dw[3] = (uint32_t)((V >> 26) & 0xFFFFFFFFu);
         dw[4] = (16u << 16);
     }
-    dw[7] = 0x3F800000;
-    pack_u64(dw + 10, depth_gpu);
+    dw[7] = 0x3F800000;                           /* Maximum Z = 1.0 */
+    pack_u64(dw + 10, depth_gpu);                 /* Depth/stencil address */
+    /* Blend: count=1 in low 4 bits, address shr(4) in remaining bits. */
     pack_u64(dw + 12, 1ULL | blend_gpu);
+    /* Shader Environment (fcopy in) at DRAW+16 (words 48..63). */
     uint32_t *se = dw + 16;
-    se[0] = 0;
-    se[1] = fau_fs_count;
-    pack_u64(se + 8, 8ULL | res_gpu);
-    pack_u64(se + 10, sp_gpu);
-    pack_u64(se + 12, tls_gpu);
-    pack_u64(se + 14, fau_fs_count ? fau_fs_gpu : 0);
+    se[0] = 0;                                    /* Attribute offset */
+    se[1] = fau_fs_count;                         /* FAU count */
+    pack_u64(se + 8, 8ULL | res_gpu);             /* Resources */
+    pack_u64(se + 10, sp_gpu);                    /* Shader program */
+    pack_u64(se + 12, tls_gpu);                   /* Thread storage */
+    pack_u64(se + 14, fau_fs_count ? fau_fs_gpu : 0);  /* FAU */
 
-    if (malloc_vertex && sp_vertex_gpu) {
-        uint32_t *pos_se = vt + 64; /* Position Shader Environment at offset 256 */
+    /* POSITION shader env at MALLOC_VERTEX_JOB offset 256 (words 64..79). */
+    if (sp_vertex_gpu) {
+        uint32_t *pos_se = vt + 64;
         pos_se[0] = 0;
         pos_se[1] = fau_vs_count;
-        pack_u64(pos_se + 8, 12ULL | res_gpu);
+        pack_u64(pos_se + 8, 8ULL | res_gpu);
         pack_u64(pos_se + 10, sp_vertex_gpu);
         pack_u64(pos_se + 12, tls_gpu);
-        pack_u64(pos_se + 14, fau_vs_gpu);
+        pack_u64(pos_se + 14, fau_vs_count ? fau_vs_gpu : 0);
     }
-    if (malloc_vertex && sp_varying_gpu) {
-        uint32_t *vary_se = vt + 80; /* Varying Shader Environment at offset 320 */
+    /* VARYING shader env at offset 320 (words 80..95). */
+    if (sp_varying_gpu) {
+        uint32_t *vary_se = vt + 80;
         vary_se[0] = 0;
         vary_se[1] = fau_vs_count;
-        pack_u64(vary_se + 8, 12ULL | res_gpu);
+        pack_u64(vary_se + 8, 8ULL | res_gpu);
         pack_u64(vary_se + 10, sp_varying_gpu);
         pack_u64(vary_se + 12, tls_gpu);
-        pack_u64(vary_se + 14, fau_vs_gpu);
+        pack_u64(vary_se + 14, fau_vs_count ? fau_vs_gpu : 0);
     }
 }
 
@@ -338,6 +389,105 @@ static inline void v9_pack_compute_job(uint32_t *cj, uint32_t local_size_x,
     pack_u64(se + 10, sp_gpu);
     pack_u64(se + 12, tls_gpu);
     pack_u64(se + 14, fau_gpu);
+}
+
+static inline uint32_t v9_pack_bits(uint32_t val, unsigned lo, unsigned hi) {
+    unsigned w = hi - lo + 1;
+    uint32_t mask = w >= 32 ? 0xFFFFFFFFu : ((1u << w) - 1u);
+    return (val & mask) << lo;
+}
+
+static inline uint32_t v9_vk_format_to_mali(uint32_t vkFormat) {
+    switch (vkFormat) {
+        case 37: /* R8G8B8A8_UNORM */ return (187u << 12) | 0u; /* RGBA order 0, sRGB 0 */
+        case 43: /* R8G8B8A8_SRGB  */ return (187u << 12) | (1u << 20);
+        case 44: /* B8G8R8A8_UNORM */ return (187u << 12) | 1u; /* BGRA order 1? */
+        case 50: /* B8G8R8A8_SRGB  */ return (187u << 12) | 1u | (1u << 20);
+        case 109: /* R32G32B32A32_SFLOAT */ return (0u << 12) | 0u; /* placeholder for float */
+        default: return (187u << 12);
+    }
+}
+
+static inline uint32_t v9_mali_tex_swizzle_default(void) { return 0x688u; /* RGBA */ }
+
+static inline uint32_t v9_clump_for_bpp(uint32_t bpp) {
+    switch (bpp) {
+        case 1: return 0; /* RAW8 */
+        case 2: return 1; /* RAW16 */
+        case 4: return 2; /* RAW32 */
+        case 8: return 3; /* RAW64 */
+        case 16: return 4; /* RAW128 */
+        default: return 2;
+    }
+}
+
+static inline void v9_pack_sampler(uint32_t *s, uint32_t mag_filter, uint32_t min_filter,
+                                   uint32_t mipmap_mode, uint32_t wrap_s, uint32_t wrap_t, uint32_t wrap_r,
+                                   bool unnormalized) {
+    memset(s, 0, 32);
+    /* Type Sampler =1 at 0:3 */
+    s[0] = v9_pack_bits(1, 0, 3) |
+           v9_pack_bits(0, 4, 5) | /* reduction average */
+           v9_pack_bits(wrap_r, 8, 11) |
+           v9_pack_bits(wrap_t, 12, 15) |
+           v9_pack_bits(wrap_s, 16, 19) |
+           v9_pack_bits(1, 21, 21) | /* round to nearest even */
+           v9_pack_bits(0, 22, 22) | /* srgb override */
+           v9_pack_bits(1, 23, 23) | /* seamless */
+           v9_pack_bits(0, 24, 24) |
+           v9_pack_bits(unnormalized ? 0 : 1, 25, 25) | /* normalized */
+           v9_pack_bits(1, 26, 26) |
+           v9_pack_bits(min_filter == 0 ? 1 : 0, 27, 27) | /* minify nearest if VK_FILTER_NEAREST(0) */
+           v9_pack_bits(mag_filter == 0 ? 1 : 0, 28, 28) |
+           v9_pack_bits(0, 29, 29) |
+           v9_pack_bits(mipmap_mode, 30, 31);
+    /* min/max LOD: 0..15 as ulod 8 frac */
+    s[1] = v9_pack_bits(0, 0, 12) | /* min lod 0 */
+           v9_pack_bits(0, 13, 15) | /* compare func never */
+           v9_pack_bits((uint32_t)(15 * 256), 16, 28); /* max lod 15 */
+    s[2] = v9_pack_bits(0, 0, 15) | /* lod bias 0 */
+           v9_pack_bits(0, 16, 20) | /* max anisotropy-1 */
+           v9_pack_bits(0, 24, 25); /* lod algorithm isotropic */
+    s[3] = 0;
+    s[4] = 0; s[5]=0; s[6]=0; s[7]=0;
+}
+
+static inline void v9_pack_texture(uint32_t *t, uint32_t dimension, uint32_t format,
+                                   uint32_t width, uint32_t height, uint32_t swizzle,
+                                   uint64_t payload_gpu) {
+    memset(t, 0, 32);
+    t[0] = v9_pack_bits(2, 0, 3) | /* Texture */
+           v9_pack_bits(dimension, 4, 6) |
+           v9_pack_bits(0, 8, 8) | /* sample corner */
+           v9_pack_bits(0, 9, 9) | /* normalize */
+           v9_pack_bits(format, 10, 31);
+    t[1] = v9_pack_bits(width - 1, 0, 15) | v9_pack_bits(height - 1, 16, 31);
+    t[2] = v9_pack_bits(swizzle & 0xFFF, 0, 11) |
+           v9_pack_bits(0, 12, 12) | /* texel interleave */
+           v9_pack_bits(0, 16, 20) | /* levels-1 (1 level =>0) */
+           v9_pack_bits(0, 24, 28); /* min level */
+    t[3] = v9_pack_bits(0, 0, 12) | /* min lod 0 */
+           v9_pack_bits(0, 13, 15) | /* log2 sample count 0 */
+           v9_pack_bits(0, 16, 28); /* max lod 0 */
+    pack_u64(t + 4, payload_gpu);
+    t[6] = v9_pack_bits(0, 0, 15); /* array_size-1 */
+    t[7] = v9_pack_bits(0, 0, 15); /* depth-1 */
+}
+
+static inline void v9_pack_generic_plane(uint32_t *p, uint64_t gpu_addr, uint32_t row_stride,
+                                         uint64_t slice_stride, uint32_t size, uint32_t width, uint32_t height) {
+    memset(p, 0, 32);
+    /* Type Plane =10 (0xA) */
+    p[0] = v9_pack_bits(10, 0, 3) |
+           v9_pack_bits(1, 4, 7) | /* Generic plane type 1 */
+           v9_pack_bits(0, 8, 11) | /* clump ordering linear */
+           v9_pack_bits(2, 24, 31); /* clump format RAW32 for RGBA8 (value 2) */
+    p[1] = size;
+    pack_u64(p + 2, gpu_addr);
+    p[4] = row_stride;
+    p[5] = 0;
+    p[6] = (uint32_t)slice_stride;
+    p[7] = v9_pack_bits(width - 1, 0, 15) | v9_pack_bits(height - 1, 16, 31);
 }
 
 #ifdef __cplusplus

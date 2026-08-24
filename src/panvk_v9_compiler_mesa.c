@@ -102,6 +102,12 @@ static bool spirv_has_function_entry_point(const uint32_t *spirv, size_t word_co
     return false;
 }
 
+static inline unsigned panvk_res_handle(unsigned table, unsigned index) {
+    return (table << 24) | (index & 0xFFFFFFu);
+}
+static inline unsigned panvk_res_handle_get_table(unsigned handle) { return handle >> 24; }
+static inline unsigned panvk_res_handle_get_index(unsigned handle) { return handle & 0xFFFFFFu; }
+
 struct lower_descriptors_ctx {
     const struct panvk_v9_pipeline_layout *layout;
     bool unsupported;
@@ -116,6 +122,137 @@ find_descriptor_binding(const struct panvk_v9_pipeline_layout *layout,
             return &layout->bindings[i];
     }
     return NULL;
+}
+
+static void get_tex_deref_binding(nir_deref_instr *deref, uint32_t *set,
+                                  uint32_t *binding, uint32_t *index_imm,
+                                  nir_def **index_ssa, uint32_t *max_idx) {
+    *index_imm = 0;
+    *max_idx = 0;
+    *index_ssa = NULL;
+    if (deref->deref_type == nir_deref_type_array) {
+        if (nir_src_is_const(deref->arr.index))
+            *index_imm = nir_src_as_uint(deref->arr.index);
+        else
+            *index_ssa = deref->arr.index.ssa;
+        /* max_idx = array_size -1 for bounds; 0 means variable */
+        *max_idx = (uint32_t)glsl_get_aoa_size(nir_deref_instr_parent(deref)->type) - 1;
+        if (*max_idx == UINT32_MAX) *max_idx = 0;
+        deref = nir_deref_instr_parent(deref);
+    }
+    assert(deref->deref_type == nir_deref_type_var);
+    nir_variable *var = deref->var;
+    *set = var->data.descriptor_set;
+    *binding = var->data.binding;
+}
+
+static bool lower_tex_instr(nir_builder *b, nir_tex_instr *tex,
+                            const struct panvk_v9_pipeline_layout *layout) {
+    bool progress = false;
+    b->cursor = nir_before_instr(&tex->instr);
+    int sampler_src_idx = nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref);
+    if (sampler_src_idx >= 0) {
+        nir_deref_instr *deref = nir_src_as_deref(tex->src[sampler_src_idx].src);
+        uint32_t set, binding, index_imm, max_idx;
+        nir_def *index_ssa;
+        get_tex_deref_binding(deref, &set, &binding, &index_imm, &index_ssa, &max_idx);
+        const struct panvk_v9_descriptor_binding *bind = find_descriptor_binding(layout, set, binding);
+        if (!bind) return false;
+        nir_tex_instr_remove_src(tex, sampler_src_idx);
+        uint32_t base = bind->resource_index;
+        if (bind->descriptor_type == 1 /* VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER */) {
+            base = (base & 0xFFFFFFu) | 0x05000000u; /* sampler table 5, same idx */
+        }
+        /* For array, stride 1 (each desc 1 slot). */
+        uint32_t static_idx = base + index_imm;
+        if (index_ssa) {
+            nir_def *offset = nir_iadd(b, nir_imm_int(b, base), nir_imul_imm(b, index_ssa, 1));
+            nir_tex_instr_add_src(tex, nir_tex_src_sampler_offset, offset);
+            /* sampler_index immediate stays 0, offset carries full handle */
+        } else {
+            tex->sampler_index = static_idx;
+        }
+        progress = true;
+    } else {
+        /* No sampler deref: use dummy sampler handle if texop needs sampler but none provided.
+         * For Valhall, dummy = table 0 index 16 (as Mesa). */
+        bool need_sampler = !(tex->op == nir_texop_txf || tex->op == nir_texop_txf_ms ||
+                              tex->op == nir_texop_txs || tex->op == nir_texop_query_levels ||
+                              tex->op == nir_texop_texture_samples ||
+                              tex->op == nir_texop_samples_identical);
+        if (need_sampler && nir_tex_instr_src_index(tex, nir_tex_src_sampler_handle) < 0 &&
+            nir_tex_instr_src_index(tex, nir_tex_src_sampler_offset) < 0) {
+            tex->sampler_index = panvk_res_handle(0, 16);
+        }
+    }
+    int tex_src_idx = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
+    if (tex_src_idx >= 0) {
+        nir_deref_instr *deref = nir_src_as_deref(tex->src[tex_src_idx].src);
+        uint32_t set, binding, index_imm, max_idx;
+        nir_def *index_ssa;
+        get_tex_deref_binding(deref, &set, &binding, &index_imm, &index_ssa, &max_idx);
+        const struct panvk_v9_descriptor_binding *bind = find_descriptor_binding(layout, set, binding);
+        if (!bind) return false;
+        nir_tex_instr_remove_src(tex, tex_src_idx);
+        uint32_t base = bind->resource_index;
+        uint32_t static_idx = base + index_imm;
+        if (index_ssa) {
+            nir_def *offset = nir_iadd(b, nir_imm_int(b, base), nir_imul_imm(b, index_ssa, 1));
+            nir_tex_instr_add_src(tex, nir_tex_src_texture_offset, offset);
+        } else {
+            tex->texture_index = static_idx;
+        }
+        progress = true;
+    }
+    return progress;
+}
+
+static bool lower_tex_pass(nir_builder *b, nir_instr *instr, void *data) {
+    if (instr->type != nir_instr_type_tex) return false;
+    return lower_tex_instr(b, nir_instr_as_tex(instr), (const struct panvk_v9_pipeline_layout *)data);
+}
+
+static nir_def *get_image_handle(nir_builder *b, nir_deref_instr *deref,
+                                 const struct panvk_v9_pipeline_layout *layout) {
+    uint32_t set, binding, index_imm, max_idx;
+    nir_def *index_ssa;
+    get_tex_deref_binding(deref, &set, &binding, &index_imm, &index_ssa, &max_idx);
+    const struct panvk_v9_descriptor_binding *bind = find_descriptor_binding(layout, set, binding);
+    if (!bind) return NULL;
+    uint32_t base = bind->resource_index;
+    if (index_ssa) {
+        return nir_iadd(b, nir_imm_int(b, base + index_imm), nir_imul_imm(b, index_ssa, 1));
+    } else {
+        return nir_imm_int(b, base + index_imm);
+    }
+}
+
+static bool lower_image_intrinsic(nir_builder *b, nir_intrinsic_instr *intr,
+                                  const struct panvk_v9_pipeline_layout *layout) {
+    b->cursor = nir_before_instr(&intr->instr);
+    nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+    nir_def *handle = get_image_handle(b, deref, layout);
+    if (!handle) return false;
+    /* Rewrite image_deref_* to plain image_* with handle index. */
+    nir_rewrite_image_intrinsic(intr, handle, nir_image_intrinsic_type_default);
+    return true;
+}
+
+static bool lower_image_pass(nir_builder *b, nir_instr *instr, void *data) {
+    if (instr->type != nir_instr_type_intrinsic) return false;
+    nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+    const struct panvk_v9_pipeline_layout *layout = data;
+    switch (intr->intrinsic) {
+    case nir_intrinsic_image_deref_load:
+    case nir_intrinsic_image_deref_store:
+    case nir_intrinsic_image_deref_atomic:
+    case nir_intrinsic_image_deref_atomic_swap:
+    case nir_intrinsic_image_deref_size:
+    case nir_intrinsic_image_deref_samples:
+        return lower_image_intrinsic(b, intr, layout);
+    default:
+        return false;
+    }
 }
 
 static bool lower_descriptor_intrinsic(nir_builder *builder,
@@ -178,6 +315,25 @@ static unsigned panvk_v9_glsl_type_size(const struct glsl_type *type,
 /* nir_lower_viewport_transform emits load_viewport_scale/offset intrinsics
  * which the real panvk inlines from the pipeline viewport state. This driver
  * has a single fixed viewport, so inline the identity transform. */
+/* pan_nir_lower_noperspective_vs inserts a nir_load_noperspective_varyings_pan
+ * intrinsic that upstream panvk resolves from a VS sysval (the bitmask of
+ * varyings marked noperspective in the linked FS).  That plumbing does not
+ * exist here, so fold the load to a constant 0: every varying is treated as
+ * perspective-correct, which is the safe default. */
+static bool fold_noperspective_load(nir_builder *builder,
+                                    nir_instr *instruction, void *data) {
+    (void)data;
+    if (instruction->type != nir_instr_type_intrinsic) return false;
+    nir_intrinsic_instr *intrinsic = nir_instr_as_intrinsic(instruction);
+    if (intrinsic->intrinsic != nir_intrinsic_load_noperspective_varyings_pan)
+        return false;
+    builder->cursor = nir_before_instr(instruction);
+    nir_def *zero = nir_imm_intN_t(builder, 0, 32);
+    nir_def_rewrite_uses(&intrinsic->def, zero);
+    nir_instr_remove(instruction);
+    return true;
+}
+
 static bool lower_viewport_sysvals(nir_builder *builder,
                                    nir_instr *instruction, void *data) {
     if (instruction->type != nir_instr_type_intrinsic) return false;
@@ -281,12 +437,67 @@ static bool fixup_mem_align(nir_builder *builder,
     return true;
 }
 
+/* The Valhall tex lowering (pan_nir_lower_tex) infinite-loops on tex
+ * instructions that still carry texture_deref/sampler_deref sources (the
+ * panvk descriptor lowering that converts them to indices is not implemented
+ * for textures here).  Reject such shaders early so the caller falls back to
+ * the compiled stub shader instead of hanging in va_lower_tex. */
+static bool check_tex_deref(nir_builder *b, nir_instr *instruction, void *data) {
+    bool *unsupported = data;
+    (void)b;
+    if (instruction->type != nir_instr_type_tex) return false;
+    nir_tex_instr *tex = nir_instr_as_tex(instruction);
+    for (unsigned i = 0; i < tex->num_srcs; i++) {
+        if (tex->src[i].src_type == nir_tex_src_texture_deref ||
+            tex->src[i].src_type == nir_tex_src_sampler_deref) {
+            *unsupported = true;
+            return false;
+        }
+    }
+    return false;
+}
+
+static bool check_image_deref(nir_builder *b, nir_instr *instruction, void *data) {
+    bool *unsupported = data;
+    (void)b;
+    if (instruction->type != nir_instr_type_intrinsic) return false;
+    nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instruction);
+    switch (intr->intrinsic) {
+    case nir_intrinsic_image_deref_load:
+    case nir_intrinsic_image_deref_store:
+    case nir_intrinsic_image_deref_atomic:
+    case nir_intrinsic_image_deref_atomic_swap:
+    case nir_intrinsic_image_deref_size:
+    case nir_intrinsic_image_deref_samples:
+        *unsupported = true;
+        return false;
+    default:
+        return false;
+    }
+}
+
 static bool lower_mem_io(nir_shader *nir,
                          const struct panvk_v9_pipeline_layout *layout) {
     struct lower_descriptors_ctx ctx = { .layout = layout };
     NIR_PASS(_, nir, nir_shader_instructions_pass, lower_descriptor_intrinsic,
              nir_metadata_block_index | nir_metadata_dominance, &ctx);
     if (ctx.unsupported) return false;
+
+    /* Lower texture/sampler derefs to handle indices (Valhall texture_index / sampler_index). */
+    NIR_PASS(_, nir, nir_shader_instructions_pass, lower_tex_pass,
+             nir_metadata_block_index | nir_metadata_dominance, (void *)layout);
+    /* Lower storage image derefs to handle indices. */
+    NIR_PASS(_, nir, nir_shader_instructions_pass, lower_image_pass,
+             nir_metadata_block_index | nir_metadata_dominance, (void *)layout);
+    bool tex_still_unsupported = false;
+    NIR_PASS(_, nir, nir_shader_instructions_pass, check_tex_deref,
+             nir_metadata_none, &tex_still_unsupported);
+    if (tex_still_unsupported) return false;
+    /* Check leftover image_deref intrinsics (storage images). */
+    bool img_still_unsupported = false;
+    NIR_PASS(_, nir, nir_shader_instructions_pass,
+             check_image_deref, nir_metadata_none, &img_still_unsupported);
+    if (img_still_unsupported) return false;
 
     NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ubo,
              nir_address_format_vec2_index_32bit_offset);
@@ -304,6 +515,95 @@ static bool lower_mem_io(nir_shader *nir,
     NIR_PASS(_, nir, nir_lower_global_vars_to_local);
     nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
     return true;
+}
+
+/* Unsized (driver-reserved) FAU push-constant region: matches panvk. The
+ * command stream writes the whole pack once per draw; forward decl below. */
+static inline unsigned panvk_v9_fau_word(uint32_t off) { return off / 8; }
+
+/* Replicates upstream panvk_vX_shader.c lower_load_push_consts() /
+ * collect_push_constant() + move_push_constant() for the packed FAU region.
+ * The Valhall backend (bi_emit_load_push_constant) requires load_push_constant
+ * to have base=0, range=0 and .base (first arg) to be a constant word index
+ * (measured in 32-bit words) inside fau->reserved. */
+struct v9_push_const_ctx {
+    BITSET_DECLARE(used, 32);
+    uint32_t count;
+};
+
+static void v9_ctx_collect(struct v9_push_const_ctx *ctx, uint32_t byte_off,
+                           uint32_t size) {
+    uint32_t first = byte_off / 8, last = (byte_off + size - 1) / 8;
+    for (uint32_t w = first; w <= last && w < 32; w++)
+        if (!BITSET_TEST(ctx->used, w)) {
+            BITSET_SET(ctx->used, w);
+            ctx->count++;
+        }
+}
+
+static bool collect_push_constants(nir_builder *b, nir_instr *instruction,
+                                   void *data) {
+    if (instruction->type != nir_instr_type_intrinsic) return false;
+    nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instruction);
+    if (intr->intrinsic != nir_intrinsic_load_push_constant) return false;
+
+    struct v9_push_const_ctx *ctx = data;
+    uint32_t base = nir_intrinsic_base(intr) + nir_intrinsic_range(intr);
+    (void)base;
+    /* SPIR-V push constant loads arrive with a constant first index (the
+     * byte offset inside the push constant block). Mark every 8-byte FAU
+     * chunk the access touches. Sysvals (base >= SYSVALS_PUSH_CONST_BASE)
+     * do not exist in this driver, so every load is a user push constant. */
+    uint32_t off = nir_intrinsic_base(intr);
+    if (nir_src_is_const(intr->src[0]))
+        off += nir_src_as_uint(intr->src[0]);
+    uint32_t size = (intr->def.bit_size / 8) * intr->def.num_components;
+    v9_ctx_collect(ctx, off, size);
+    (void)b;
+    return false;
+}
+
+/* Remap each user push constant access to its packed FAU word: sysvals get the
+ * first words (none here), then the used 8-byte chunks in offset order each
+ * own 2 consecutive 32-bit words. */
+static bool move_push_constants(nir_builder *b, nir_instr *instruction,
+                                void *data) {
+    if (instruction->type != nir_instr_type_intrinsic) return false;
+    nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instruction);
+    if (intr->intrinsic != nir_intrinsic_load_push_constant) return false;
+    if (!nir_src_is_const(intr->src[0])) return false;
+
+    const struct v9_push_const_ctx *ctx = data;
+    uint32_t off = nir_intrinsic_base(intr) + nir_src_as_uint(intr->src[0]);
+    uint32_t word = panvk_v9_fau_word(off);
+    uint32_t packed = 0;
+    for (uint32_t w = 0; w < word; w++)
+        if (BITSET_TEST(ctx->used, w)) packed += 2; /* one 8-byte chunk = 2 words */
+    packed = (packed + (off & 7) / 4) * 4;
+
+    b->cursor = nir_before_instr(instruction);
+    nir_src_rewrite(&intr->src[0], nir_imm_int(b, packed));
+    nir_intrinsic_set_base(intr, 0);
+    nir_intrinsic_set_range(intr, 0);
+    (void)ctx;
+    return true;
+}
+
+/* Build the FAU word layout for the given NIR shader: sysval words first
+ * (none), then user push constants, then reserved for immediates. Returns
+ * the number of reserved FAU words (sysvals+push consts) so the backend can
+ * place promoted immediates after them. */
+static uint32_t build_fau_push_layout(nir_shader *nir,
+                                      struct pan_compile_inputs *inputs,
+                                      struct v9_push_const_ctx *ctx) {
+    memset(ctx, 0, sizeof(*ctx));
+    NIR_PASS(_, nir, nir_shader_instructions_pass, collect_push_constants,
+             nir_metadata_block_index | nir_metadata_dominance, ctx);
+    /* Two 32-bit words per used 8-byte chunk. */
+    inputs->fau.reserved = ctx->count * 2;
+    NIR_PASS(_, nir, nir_shader_instructions_pass, move_push_constants,
+             nir_metadata_block_index | nir_metadata_dominance, ctx);
+    return ctx->count;
 }
 
 int panvk_v9_compile_spirv(const uint32_t *spirv, size_t spirv_size,
@@ -424,6 +724,9 @@ int panvk_v9_compile_spirv(const uint32_t *spirv, size_t spirv_size,
             fclose(f);
         }
     }
+    if (stage == PANVK_V9_SHADER_VERTEX)
+        NIR_PASS(_, nir, nir_shader_instructions_pass, fold_noperspective_load,
+                 nir_metadata_none, NULL);
     if (stage != PANVK_V9_SHADER_COMPUTE)
         NIR_PASS(_, nir, nir_shader_instructions_pass, lower_viewport_sysvals,
                  nir_metadata_none, NULL);

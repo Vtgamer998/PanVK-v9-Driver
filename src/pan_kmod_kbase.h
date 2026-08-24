@@ -60,6 +60,8 @@ int pan_kmod_submit_atom(struct pan_kmod_dev *dev, uint64_t jc_gpu, uint32_t cor
 /* Best-effort flush submit: never poisons/wedges the device on timeout (a
  * real hang after an already-rendered frame would otherwise make the whole
  * device unusable).  Used for the post-fragment L2 drain. */
+int pan_kmod_submit_tiler_retry(struct pan_kmod_dev *dev, uint64_t jc_gpu,
+                                uint32_t atom_id, uint32_t *event_code);
 int pan_kmod_submit_flush_timeout(struct pan_kmod_dev *dev, uint64_t jc_gpu,
                                   uint32_t atom_id, uint32_t *event_code, int timeout_ms);
 
